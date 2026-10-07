@@ -101,7 +101,10 @@ def main() -> None:
     reference_engine, p2p_engine = (_build_engine(model_config, parallelism) for _ in range(2))
     _assert_identical(reference_engine, p2p_engine, "at startup")
     published_locations_by_name = _get_published_locations(p2p_engine)
-    model_replica = build_model_replica(RolloutEngineRankConfig(parallelism, server_args), str(args.model_dir))
+    model_replica = build_model_replica(
+        RolloutEngineRankConfig(runner_role="target", parallelism=parallelism, server_args=server_args),
+        str(args.model_dir),
+    )
     buffer_nbytes = max(
         BUFFER_NBYTES, max(layout.occupied_nbytes for layout in model_replica.transfer_buffer_param_layouts.values())
     )
