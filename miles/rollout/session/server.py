@@ -6,6 +6,7 @@
 - ``run_session_server`` is the subprocess entry point: fresh interpreter, so it configures logging and the process title itself, then serves uvicorn.
 """
 
+import gc
 import json
 import logging
 
@@ -111,6 +112,11 @@ def run_session_server(config: SessionServerConfig):
     setproctitle.setproctitle("miles-session-server")
 
     server = SessionServer(config)
+    # Every record keeps its turn's full prompt `input_ids`, so a full collection walks O(turns^2) list items
+    # per session (0.3-0.8 s pauses at 64 sessions) while reclaiming almost nothing; young collections still
+    # free per-request cycles. Consider a full collection after 100 generation-1 collections instead of 10.
+    gen0, gen1, _ = gc.get_threshold()
+    gc.set_threshold(gen0, gen1, 100)
     logger.info(
         "[session-server] Starting on %s:%s, proxying to %s",
         config.host,
