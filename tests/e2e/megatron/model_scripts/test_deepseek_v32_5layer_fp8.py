@@ -35,6 +35,9 @@ def _args() -> ScriptArgs:
         num_gpus_per_node=4,
         from_bf16_ckpt=False,
         num_rollout=2,
+        rollout_batch_size=4,
+        n_samples_per_prompt=4,
+        global_batch_size=16,
         no_save=True,
         extra_args=(
             "--ci-test --check-weight-update-allow-quant-error --bf16 "
