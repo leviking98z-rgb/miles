@@ -1,6 +1,7 @@
 import gc
 import os
 import shutil
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -115,20 +116,26 @@ def main():
     world_size = int(os.getenv("WORLD_SIZE") or os.getenv("SLURM_NTASKS") or 1)
     local_rank = int(os.getenv("LOCAL_RANK") or os.getenv("SLURM_LOCALID") or 0)
     global_rank = int(os.getenv("RANK") or os.getenv("SLURM_PROCID") or 0)
-
-    torch.cuda.set_device(local_rank)
     os.environ.setdefault("WORLD_SIZE", str(world_size))
     os.environ.setdefault("RANK", str(global_rank))
     os.environ.setdefault("LOCAL_RANK", str(local_rank))
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "12355")
+    args = get_args()
+    distributed_timeout = timedelta(minutes=args.distributed_timeout_minutes)
+
+    torch.cuda.set_device(local_rank)
     dist.init_process_group(
         backend="nccl",
         world_size=world_size,
         rank=global_rank,
         device_id=torch.device(f"cuda:{local_rank}"),
+        timeout=distributed_timeout,
     )
-    args = get_args()
+    print(
+        f"Initialized distributed process group on rank {global_rank} "
+        f"with timeout_seconds={distributed_timeout.total_seconds():.0f}"
+    )
     init(args)
     model = get_model(get_model_provider_func(args), ModelType.encoder_or_decoder, wrap_with_ddp=False)
     enforce_marked_param_dtypes(model)
