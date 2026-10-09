@@ -1,8 +1,12 @@
+import json
+import sys
+
 from tests.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="stage-a-cpu", labels=[])
 
-from miles.utils.processing_utils import extract_multimodal_train_inputs
+from miles.utils import processing_utils
+from miles.utils.processing_utils import extract_multimodal_train_inputs, load_processor
 
 
 def test_extract_multimodal_train_inputs_drops_qwen3_vl_token_metadata():
@@ -30,3 +34,37 @@ def test_extract_multimodal_train_inputs_drops_qwen3_vl_token_metadata():
         )
         is None
     )
+
+
+def test_load_processor_dispatches_local_glm5_next_checkpoint(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "glm5_next"}))
+    (tmp_path / "processor_config.json").write_text("{}")
+    expected = object()
+    calls = []
+
+    from miles_plugins.models.glm5_next import processor as glm5_next_processor
+
+    def fake_load(name_or_path, **kwargs):
+        calls.append((name_or_path, kwargs))
+        return expected
+
+    monkeypatch.setattr(glm5_next_processor, "load_glm5_next_processor", fake_load)
+
+    assert load_processor(str(tmp_path), revision="test-revision") is expected
+    assert calls == [(str(tmp_path), {"revision": "test-revision"})]
+
+
+def test_load_processor_does_not_import_glm_vision_for_other_checkpoints(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "text_only"}))
+    monkeypatch.setattr(processing_utils.AutoProcessor, "from_pretrained", lambda *args, **kwargs: None)
+    monkeypatch.setitem(sys.modules, "miles_plugins.models.glm5_next.processor", None)
+
+    assert load_processor(str(tmp_path)) is None
+
+
+def test_load_processor_preserves_legacy_glm_text_checkpoint_without_processor(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "glm5_next"}))
+    monkeypatch.setattr(processing_utils.AutoProcessor, "from_pretrained", lambda *args, **kwargs: None)
+    monkeypatch.setitem(sys.modules, "miles_plugins.models.glm5_next.processor", None)
+
+    assert load_processor(str(tmp_path)) is None

@@ -1,6 +1,6 @@
 ---
 title: GLM-5.3-Flash
-description: RL recipe for GLM-5.3-Flash, a KDA + DSA hybrid MoE with mHC hyper-connections and NoPE MLA.
+description: RL and BF16 image SFT recipes for GLM-5.3-Flash, a KDA + DSA hybrid MoE with mHC hyper-connections and NoPE MLA.
 ---
 
 Implementation: [`radixark/miles#2786`](https://github.com/radixark/miles/pull/2786). It goes
@@ -105,3 +105,98 @@ From the validation run in [#2786](https://github.com/radixark/miles/pull/2786) 
 
 `train/train_rollout_logprob_abs_diff` is the one to read first on a fresh bring-up: it
 covers the KDA, DSA and hyper-connection paths at once.
+
+## 6. BF16 Image SFT
+
+`scripts/run_glm5_3_flash_vision_sft.py` trains the language model from image-text
+conversations while **freezing the full visual tower, including its projector**.
+It runs `train_async.py --debug-train-only`: no generation, SGLang engine, reward
+model, or evaluation is started.
+
+Use a BF16 HF checkpoint containing `model.visual.*`, `vision_config`, tokenizer
+files, `chat_template.jinja`, and `processor_config.json`. The converted Megatron
+checkpoint contains only language parameters and uses the existing GLM-5.3
+conversion recipe. The visual weights are loaded strictly from the HF checkpoint
+on the first pipeline stage. The compatibility processor supports the environment's
+fixed `transformers==5.12.1`; upgrading Transformers is not required.
+
+### Dataset
+
+Each JSONL row, or Parquet record, contains a `messages` conversation and an
+`images` **list**. Use one `<image>` placeholder per image, in the same order.
+Image paths must be accessible on the training nodes.
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "<image>What number is written in the image?"},
+    {"role": "assistant", "content": "42"}
+  ],
+  "images": ["/absolute/path/to/image.png"]
+}
+```
+
+The launcher sets `--input-key messages --multimodal-keys '{"image":"images"}'`.
+Do **not** pass `--apply-chat-template`: the SFT rollout keeps raw messages,
+renders the complete GLM template, expands image tokens through the processor,
+and then aligns the assistant-only loss mask. Images retain their original
+dimensions until GLM's own dynamic resize/patchify. Multiple images and multi-turn
+conversations are supported; `step_loss_mask: 0` disables supervision for an
+assistant turn. Image embedding tokens are never supervised.
+
+### Launch
+
+Eight-GPU 4-layer smoke:
+
+```bash
+python scripts/run_glm5_3_flash_vision_sft.py \
+  --num-nodes 1 --num-gpus-per-node 8 \
+  --hf-checkpoint /root/models/GLM-5.3-Flash-4layer-BF16 \
+  --ref-load /root/models/glm5.3-flash-4layer_torch_dist \
+  --prompt-data /root/datasets/glm53_image_sft.jsonl \
+  --output-dir /root/runs/glm53_image_sft \
+  --num-rollout 2 --save-interval 1
+```
+
+Full-model recipe on an externally joined 32-GPU Ray cluster:
+
+```bash
+MILES_SCRIPT_EXTERNAL_RAY=1 python scripts/run_glm5_3_flash_vision_sft.py \
+  --model-name GLM-5.3-Flash --num-nodes 4 --num-gpus-per-node 8 \
+  --hf-checkpoint /root/models/GLM-5.3-Flash-BF16 \
+  --ref-load /root/models/glm5.3-flash_torch_dist \
+  --prompt-data /root/datasets/glm53_image_sft.jsonl \
+  --output-dir /root/runs/glm53_image_sft_full
+```
+
+| Shape | TP | PP | EP | CP |
+|---|---|---|---|---|
+| 1 x 8, 4-layer | 2 | 2 | 2 | 1 |
+| 4 x 8, full | 8 | 4 | 8 | 1 |
+| 8 x 8, full | 8 | 4 | 16 | 1 |
+
+All shapes use sequence parallelism. Defaults are 16 conversations per optimizer
+step, BF16, Adam at `lr 1e-5`, full recompute, dynamic batching with
+`max_tokens_per_gpu=8192`, and CPU-offloaded Adam states. Adjust batch sizes together
+using `--rollout-batch-size` and `--global-batch-size`. The launcher reads the local
+checkpoint's `text_config.rope_theta` so older checkpoint metadata remains consistent
+with startup validation; `--rotary-base` can override it explicitly.
+
+The image path was validated on 8 H20 GPUs with a 4-layer BF16 slice at
+TP2/PP2/EP2/SP/CP1: two fresh optimizer steps and one resumed step, including
+single-image, multi-image, and masked multi-turn samples. All ranks produced finite,
+nonzero language gradients and successful optimizer updates. The distributed
+checkpoint included Adam and RNG state and no visual parameters. This is a
+functional smoke test, not an image-task accuracy or convergence benchmark.
+
+### Limits And Resume
+
+- Image input only; video and audio inputs are rejected explicitly.
+- Context parallelism must be 1, and training uses packed `--qkv-format thd`.
+- The visual tower is frozen, replicated on first-stage TP ranks, and excluded
+  from the optimizer and Megatron checkpoint. This is not visual-tower finetuning.
+- Reuse the same `--output-dir` and HF checkpoint to resume. Language weights,
+  optimizer state, and RNG are saved normally; visual weights are reloaded from
+  the original HF checkpoint.
+- The full-model topology reuses the text-training recipe. A 4-layer smoke
+  validates the image path, not full-model convergence or throughput.

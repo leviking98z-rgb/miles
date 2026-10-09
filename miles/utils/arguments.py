@@ -2459,7 +2459,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--loss-mask-type",
                 type=str,
                 default="qwen",
-                choices=["qwen", "qwen3", "distill_qwen"],
+                choices=["qwen", "qwen3", "distill_qwen", "glm5"],
                 help="Loss mask type",
             )
             parser.add_argument(
