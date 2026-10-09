@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Frozen GLM-5.3 visual tower and Megatron model provider."""
+"""GLM-5.3 visual tower and Megatron model provider."""
 
 from __future__ import annotations
 
 import json
+import logging
 from contextlib import contextmanager
 from copy import copy
 from pathlib import Path
@@ -36,7 +37,20 @@ from miles.utils.hf_utils.config import load_hf_config
 if TYPE_CHECKING:
     from megatron.core.models.gpt import GPTModel
 
+logger = logging.getLogger(__name__)
+
 _VISUAL_PREFIX = "model.visual."
+
+# Attribute name of the visual tower once it is a real submodule, which is also the
+# ``visual.*`` prefix its parameters take in the optimizer and the distributed checkpoint.
+VISUAL_MODULE_NAME = "visual"
+
+# Trainable scopes, ordered from smallest to largest.
+VISION_TRAINABLE_CHOICES = ("none", "projector", "full")
+
+# The image-feature projection that runs after the ViT blocks. ``patch_embed`` and
+# ``blocks`` are the pretrained encoder itself and stay frozen unless "full" is requested.
+_PROJECTOR_MODULES = ("post_layernorm", "downsample", "merger")
 
 
 class Glm5NextVisionMLP(GlmOcrVisionMlp):
@@ -125,13 +139,47 @@ def _load_visual_state_dict(hf_checkpoint: str) -> dict[str, torch.Tensor]:
     return state_dict
 
 
+def _trainable_parameter_names(visual: Glm5NextVisionModel, trainable: str) -> set[str]:
+    """Names of the visual parameters the requested scope trains."""
+    if trainable not in VISION_TRAINABLE_CHOICES:
+        raise ValueError(f"--glm5-vision-trainable must be one of {VISION_TRAINABLE_CHOICES}, got {trainable!r}")
+    if trainable == "none":
+        return set()
+    if trainable == "full":
+        return {name for name, _ in visual.named_parameters()}
+    return {
+        f"{module_name}.{name}"
+        for module_name in _PROJECTOR_MODULES
+        for name, _ in getattr(visual, module_name).named_parameters()
+    }
+
+
+def _apply_trainable_scope(visual: Glm5NextVisionModel, trainable: str, *, sequence_parallel: bool) -> None:
+    """Select which visual parameters train, and mark their gradients for TP reduction."""
+    trainable_names = _trainable_parameter_names(visual, trainable)
+    for name, parameter in visual.named_parameters():
+        requires_grad = name in trainable_names
+        parameter.requires_grad_(requires_grad)
+        if requires_grad:
+            # The tower is replicated across the TP domain but each rank's loss only covers
+            # its own sequence slice, so every rank holds a partial gradient. Megatron sums
+            # these in finalize_model_grads._allreduce_non_tensor_model_parallel_grads, which
+            # gates on config.sequence_parallel and this per-parameter flag.
+            parameter.sequence_parallel = sequence_parallel
+    # Frozen towers stay in eval mode; a trainable tower must honour train/eval like the
+    # language model so dropout and any norm statistics follow the training loop.
+    visual.train(trainable != "none")
+
+
 def build_glm5_next_visual(
     hf_checkpoint: str,
     *,
     device: torch.device | int,
     dtype: torch.dtype,
+    trainable: str = "none",
+    sequence_parallel: bool = False,
 ) -> Glm5NextVisionModel:
-    """Construct and strictly load the checkpoint's frozen visual tower."""
+    """Construct and strictly load the checkpoint's visual tower."""
     hf_config = load_hf_config(hf_checkpoint)
     vision_config = hf_config.vision_config
     vision_config._attn_implementation = "sdpa"
@@ -139,8 +187,7 @@ def build_glm5_next_visual(
         visual = Glm5NextVisionModel(vision_config)
 
     visual.load_state_dict(_load_visual_state_dict(hf_checkpoint), strict=True)
-    visual.requires_grad_(False)
-    visual.eval()
+    _apply_trainable_scope(visual, trainable, sequence_parallel=sequence_parallel)
     return visual
 
 
@@ -194,8 +241,15 @@ def wire_glm5_next_visual(
     hf_checkpoint: str,
     *,
     device: torch.device | None = None,
+    trainable: str = "none",
 ) -> None:
-    """Attach frozen image encoding while leaving language parameter names unchanged."""
+    """Attach image encoding while leaving language parameter names unchanged.
+
+    With ``trainable="none"`` the tower is held outside the module tree, which keeps it out
+    of the optimizer and the distributed checkpoint. Any other scope registers it as the
+    ``visual`` submodule, so Megatron's parameter walks pick its trainable parameters up for
+    the optimizer, the DDP gradient buckets and the checkpoint.
+    """
     original_forward = model.forward
     if not model.pre_process:
 
@@ -208,11 +262,26 @@ def wire_glm5_next_visual(
 
     device = device or torch.device("cuda", torch.cuda.current_device())
     hf_config = load_hf_config(hf_checkpoint)
-    visual = build_glm5_next_visual(hf_checkpoint, device=device, dtype=model.config.params_dtype)
-    visual.requires_grad_(False).eval()
-    # Keep the frozen tower outside the Megatron optimizer and distributed checkpoint.
-    model.__dict__["_glm5_next_visual"] = visual
+    visual = build_glm5_next_visual(
+        hf_checkpoint,
+        device=device,
+        dtype=model.config.params_dtype,
+        trainable=trainable,
+        sequence_parallel=model.config.sequence_parallel,
+    )
+    train_visual = trainable != "none"
+    if train_visual:
+        # A registered submodule puts visual.* into named_parameters(), which is what the
+        # optimizer, DDP and sharded_state_dict all walk.
+        model.add_module(VISUAL_MODULE_NAME, visual)
+    else:
+        visual.requires_grad_(False).eval()
+        # Keep the frozen tower outside the Megatron optimizer and distributed checkpoint.
+        model.__dict__["_glm5_next_visual"] = visual
     image_token_id = hf_config.image_token_id
+
+    def _visual_tower() -> Glm5NextVisionModel:
+        return getattr(model, VISUAL_MODULE_NAME) if train_visual else model.__dict__["_glm5_next_visual"]
 
     def _multimodal_forward(*args, pixel_values=None, image_grid_thw=None, **kwargs):
         _reject_non_image_inputs(kwargs)
@@ -231,9 +300,12 @@ def wire_glm5_next_visual(
         position_ids = kwargs.get("position_ids", args[1] if len(args) > 1 else None)
         decoder_input = model.embedding(input_ids=input_ids, position_ids=position_ids)
 
-        with torch.no_grad():
-            image_embeddings = model.__dict__["_glm5_next_visual"](
-                pixel_values.to(device=device, dtype=visual.dtype),
+        tower = _visual_tower()
+        # The grad context must cover only the tower forward: _scatter_image_embeddings clones
+        # decoder_input, and cloning under no_grad would detach the embedding graph.
+        with torch.enable_grad() if train_visual else torch.no_grad():
+            image_embeddings = tower(
+                pixel_values.to(device=device, dtype=tower.dtype),
                 grid_thw=image_grid_thw.to(device=device),
             ).pooler_output
         image_positions = torch.nonzero(input_ids.reshape(-1) == image_token_id, as_tuple=False).flatten()
@@ -253,12 +325,71 @@ def wire_glm5_next_visual(
     model.forward = _multimodal_forward
 
 
+def _checkpoint_has_visual_weights(load_dir: str | Path) -> bool:
+    """Whether a torch_dist checkpoint already stores ``visual.*`` parameters."""
+    from torch.distributed.checkpoint import FileSystemReader
+
+    path = Path(load_dir)
+    step_file = path / "latest_checkpointed_iteration.txt"
+    if step_file.is_file():
+        step = step_file.read_text().strip()
+        path = path / (step if step == "release" else f"iter_{int(step):07d}")
+    if not path.is_dir():
+        return False
+    return any(
+        key.split(".")[0] == VISUAL_MODULE_NAME for key in FileSystemReader(path).read_metadata().state_dict_metadata
+    )
+
+
+@contextmanager
+def hide_visual_missing_from_checkpoint(model_chunks, load_dir: str | None):
+    """Hide a trainable visual tower while loading a checkpoint that predates it.
+
+    A fresh run loads the language-only ``--ref-load`` conversion, which has no ``visual.*``
+    entries. Megatron's default ``--dist-ckpt-strictness=assume_ok_unexpected`` leaves those
+    keys for the load strategy to reject, so the tower has to leave the module tree for the
+    duration of the load, exactly as ``_hide_critic_value_head_from_hf_load`` does for the
+    critic head. The HF checkpoint already supplied these weights at build time, so skipping
+    them here keeps them; a checkpoint that does carry them loads normally.
+    """
+    from megatron.core.utils import unwrap_model
+
+    hidden = []
+    if load_dir and not _checkpoint_has_visual_weights(load_dir):
+        for chunk in unwrap_model(model_chunks):
+            visual = getattr(chunk, VISUAL_MODULE_NAME, None)
+            if isinstance(visual, Glm5NextVisionModel):
+                delattr(chunk, VISUAL_MODULE_NAME)
+                hidden.append((chunk, visual))
+        if hidden:
+            logger.info(
+                "%s has no %s.* weights; keeping the HF-loaded visual tower across this load",
+                load_dir,
+                VISUAL_MODULE_NAME,
+            )
+    try:
+        yield
+    finally:
+        for chunk, visual in hidden:
+            chunk.add_module(VISUAL_MODULE_NAME, visual)
+
+
+def has_trainable_glm5_next_visual(model_chunks) -> bool:
+    """Whether any model chunk carries the visual tower as a registered submodule."""
+    from megatron.core.utils import unwrap_model
+
+    return any(
+        isinstance(getattr(chunk, VISUAL_MODULE_NAME, None), Glm5NextVisionModel)
+        for chunk in unwrap_model(model_chunks)
+    )
+
+
 def glm5_next_vlm_model_provider(
     pre_process: bool = True,
     post_process: bool = True,
     vp_stage=None,
 ) -> GPTModel:
-    """Build the validated GLM-5.3 text model and attach its frozen visual tower."""
+    """Build the validated GLM-5.3 text model and attach its visual tower."""
     from megatron.training import get_args
 
     from miles.backends.megatron_utils.model_provider import get_model_provider_func
@@ -274,5 +405,5 @@ def glm5_next_vlm_model_provider(
     base_provider = get_model_provider_func(provider_args, role="actor")
 
     model = base_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-    wire_glm5_next_visual(model, args.hf_checkpoint)
+    wire_glm5_next_visual(model, args.hf_checkpoint, trainable=getattr(args, "glm5_vision_trainable", "none"))
     return model

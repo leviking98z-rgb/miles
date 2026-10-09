@@ -1,4 +1,4 @@
-"""GLM-5.3-Flash BF16 image SFT with a frozen visual tower.
+"""GLM-5.3-Flash BF16 image SFT with a trainable or frozen visual tower.
 
 The BF16 HF checkpoint must contain model.visual weights and processor metadata.
 The language checkpoint must already be converted to Megatron torch_dist. For
@@ -13,6 +13,7 @@ Args:
   --rollout-batch-size / --global-batch-size: Number of conversations per step.
   --output-dir: Training checkpoint destination; reused for resume.
   --save-interval: Checkpoint interval in optimizer steps.
+  --vision-trainable: Visual parameters to train; none, projector or full.
   --optimizer-cpu-offload: Offload Adam states to host RAM.
   --rotary-base: Override the RoPE value read from local checkpoint metadata.
 
@@ -69,6 +70,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     save_interval: int = 100
     lr: float = 1e-5
     rotary_base: int | None = None
+    vision_trainable: Literal["none", "projector", "full"] = "projector"
     optimizer_cpu_offload: bool = True
     extra_args: str = ""
 
@@ -155,6 +157,7 @@ def execute(args: ScriptArgs):
         # The local checkpoint's RoPE metadata overrides the model script's default.
         f"--rotary-base {args.rotary_base} "
         "--custom-model-provider-path miles_plugins.models.glm5_next.vision.glm5_next_vlm_model_provider "
+        f"--glm5-vision-trainable {args.vision_trainable} "
         "--model-name glm5_next --qkv-format thd "
         "--attention-dropout 0.0 --hidden-dropout 0.0 "
         "--attention-softmax-in-fp32 --accumulate-allreduce-grads-in-fp32 "

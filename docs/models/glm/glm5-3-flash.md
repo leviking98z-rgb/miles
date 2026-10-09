@@ -108,10 +108,22 @@ covers the KDA, DSA and hyper-connection paths at once.
 
 ## 6. BF16 Image SFT
 
-`scripts/run_glm5_3_flash_vision_sft.py` trains the language model from image-text
-conversations while **freezing the full visual tower, including its projector**.
+`scripts/run_glm5_3_flash_vision_sft.py` trains GLM-5.3-Flash from image-text
+conversations. `--vision-trainable` selects how much of the visual tower trains
+alongside the language model; it defaults to `projector`.
 It runs `train_async.py --debug-train-only`: no generation, SGLang engine, reward
 model, or evaluation is started.
+
+| `--vision-trainable` | Trains | Visual parameters |
+|---|---|---|
+| `none` | language only | 0 of 563,627,008 |
+| `projector` (default) | `post_layernorm`, `downsample`, `merger` | 159,396,864 |
+| `full` | also `patch_embed` and the 24 ViT blocks | 563,627,008 |
+
+With `none` the tower stays outside the optimizer and the distributed checkpoint.
+Any other scope registers it as the `visual` submodule, so its trainable
+parameters join the optimizer, the DDP gradient buckets and the checkpoint, and
+`visual.*` keys appear in the saved checkpoint.
 
 Use a BF16 HF checkpoint containing `model.visual.*`, `vision_config`, tokenizer
 files, `chat_template.jinja`, and `processor_config.json`. The converted Megatron
@@ -183,20 +195,34 @@ checkpoint's `text_config.rope_theta` so older checkpoint metadata remains consi
 with startup validation; `--rotary-base` can override it explicitly.
 
 The image path was validated on 8 H20 GPUs with a 4-layer BF16 slice at
-TP2/PP2/EP2/SP/CP1: two fresh optimizer steps and one resumed step, including
-single-image, multi-image, and masked multi-turn samples. All ranks produced finite,
-nonzero language gradients and successful optimizer updates. The distributed
-checkpoint included Adam and RNG state and no visual parameters. This is a
+TP2/PP2/EP2/SP/CP1: two fresh optimizer steps and one resumed step at
+`--vision-trainable projector`, including single-image, multi-image, and masked
+multi-turn samples. Loss moved `13.7438 -> 13.7231 -> 13.5854`. Every first-stage
+rank produced finite, nonzero gradients for both the language and the trainable
+visual parameters, the frozen visual parameters kept no gradient, and all ranks
+completed their optimizer updates. The distributed checkpoint held Adam state, RNG
+state and 347 `visual.*` entries, and `visual.merger.post_projection_norm.bias`
+changed across both the fresh and the resumed update. `--vision-trainable full`
+also completed a step with all 563,627,008 visual parameters trainable. This is a
 functional smoke test, not an image-task accuracy or convergence benchmark.
 
 ### Limits And Resume
 
 - Image input only; video and audio inputs are rejected explicitly.
 - Context parallelism must be 1, and training uses packed `--qkv-format thd`.
-- The visual tower is frozen, replicated on first-stage TP ranks, and excluded
-  from the optimizer and Megatron checkpoint. This is not visual-tower finetuning.
+- The visual tower is replicated on first-stage TP ranks. Under sequence
+  parallelism its trainable gradients are partial per rank, so they are marked for
+  Megatron's TP sum-reduction in `finalize_model_grads`.
+- With `--vision-trainable none` the tower is excluded from the optimizer and the
+  Megatron checkpoint, and its weights are reloaded from the HF checkpoint on every
+  start. This mode is not visual-tower finetuning.
+- Any other scope writes `visual.*` into the checkpoint, so an existing run cannot
+  change `--vision-trainable` on resume: the saved optimizer state no longer matches
+  the parameter set and the load fails rather than training a different model.
+- A fresh run loads the language-only conversion, which has no `visual.*` entries;
+  the tower leaves the module tree for that load and keeps its HF-loaded weights.
 - Reuse the same `--output-dir` and HF checkpoint to resume. Language weights,
-  optimizer state, and RNG are saved normally; visual weights are reloaded from
-  the original HF checkpoint.
+  trainable visual weights, optimizer state, and RNG are saved and restored
+  normally.
 - The full-model topology reuses the text-training recipe. A 4-layer smoke
   validates the image path, not full-model convergence or throughput.

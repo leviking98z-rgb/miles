@@ -105,6 +105,7 @@ export no_proxy=127.0.0.1 && export PYTHONUNBUFFERED=1 && ray job submit
   --bf16
   --rotary-base 10000
   --custom-model-provider-path miles_plugins.models.glm5_next.vision.glm5_next_vlm_model_provider
+  --glm5-vision-trainable projector
   --model-name glm5_next
   --qkv-format thd
   --attention-dropout 0.0

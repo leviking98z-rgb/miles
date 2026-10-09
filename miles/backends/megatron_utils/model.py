@@ -981,7 +981,17 @@ def load_model_state(
 
         load_ctx = hide_adapters(model)
     else:
-        load_ctx = nullcontext()
+        from miles_plugins.models.glm5_next.vision import (
+            has_trainable_glm5_next_visual,
+            hide_visual_missing_from_checkpoint,
+        )
+
+        if has_trainable_glm5_next_visual(model):
+            # A fresh image-SFT run loads the language-only conversion, which has no visual.*
+            # entries; hide the tower so those keys don't reach the load as unexpected.
+            load_ctx = hide_visual_missing_from_checkpoint(model, getattr(args, "load", None))
+        else:
+            load_ctx = nullcontext()
 
     load_dir = getattr(args, "load", None)
     native_optimizer_restored = False

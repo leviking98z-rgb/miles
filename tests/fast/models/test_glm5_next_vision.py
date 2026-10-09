@@ -59,6 +59,56 @@ def test_build_glm5_next_visual_loads_strictly_and_freezes(tmp_path, monkeypatch
         torch.testing.assert_close(visual.state_dict()[key], value)
 
 
+def _built_visual(tmp_path, monkeypatch, **kwargs):
+    config = _tiny_vision_config()
+    save_file(
+        {f"model.visual.{key}": value for key, value in Glm5NextVisionModel(config).state_dict().items()},
+        tmp_path / "model.safetensors",
+    )
+    monkeypatch.setattr(vision_module, "load_hf_config", lambda path: SimpleNamespace(vision_config=config))
+    return vision_module.build_glm5_next_visual(
+        str(tmp_path), device=torch.device("cpu"), dtype=torch.float32, **kwargs
+    )
+
+
+@pytest.mark.parametrize(
+    ("trainable", "expected_prefixes"),
+    (
+        ("none", ()),
+        ("projector", ("post_layernorm.", "downsample.", "merger.")),
+        ("full", ("patch_embed.", "blocks.", "post_layernorm.", "downsample.", "merger.")),
+    ),
+)
+def test_build_glm5_next_visual_trains_only_the_requested_scope(tmp_path, monkeypatch, trainable, expected_prefixes):
+    visual = _built_visual(tmp_path, monkeypatch, trainable=trainable)
+
+    trained = {name for name, parameter in visual.named_parameters() if parameter.requires_grad}
+    assert trained == {
+        name for name, _ in visual.named_parameters() if name.startswith(tuple(expected_prefixes) or ("\0",))
+    }
+    assert visual.training == (trainable != "none")
+    # "full" must cover every parameter, and "projector" must be a strict non-empty subset.
+    if trainable == "full":
+        assert trained == {name for name, _ in visual.named_parameters()}
+    elif trainable == "projector":
+        assert 0 < len(trained) < len(list(visual.named_parameters()))
+
+
+@pytest.mark.parametrize("sequence_parallel", (False, True))
+def test_build_glm5_next_visual_marks_trainable_grads_for_tp_reduction(tmp_path, monkeypatch, sequence_parallel):
+    visual = _built_visual(tmp_path, monkeypatch, trainable="projector", sequence_parallel=sequence_parallel)
+
+    for name, parameter in visual.named_parameters():
+        # Megatron sums a gradient across the TP domain only when the parameter carries this
+        # flag; replicated-but-trainable visual params must opt in under sequence parallelism.
+        assert getattr(parameter, "sequence_parallel", False) == (parameter.requires_grad and sequence_parallel), name
+
+
+def test_build_glm5_next_visual_rejects_an_unknown_scope(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="glm5-vision-trainable"):
+        _built_visual(tmp_path, monkeypatch, trainable="projector-only")
+
+
 class _Embedding(torch.nn.Embedding):
     def forward(self, input_ids, position_ids=None):
         return super().forward(input_ids).transpose(0, 1).contiguous()
@@ -106,6 +156,60 @@ def wired_model(monkeypatch):
     monkeypatch.setitem(sys.modules, "megatron.core", core)
     vision_module.wire_glm5_next_visual(model, "/checkpoint", device=torch.device("cpu"))
     return model, visual
+
+
+def _wire_trainable(monkeypatch, visual, trainable):
+    model = _LanguageModel()
+    monkeypatch.setattr(vision_module, "build_glm5_next_visual", lambda *args, **kwargs: visual)
+    monkeypatch.setattr(vision_module, "load_hf_config", lambda path: SimpleNamespace(image_token_id=99))
+    core = ModuleType("megatron.core")
+    core.parallel_state = SimpleNamespace(
+        get_tensor_model_parallel_world_size=lambda: 1,
+        get_tensor_model_parallel_rank=lambda: 0,
+    )
+    monkeypatch.setitem(sys.modules, "megatron.core", core)
+    vision_module.wire_glm5_next_visual(model, "/checkpoint", device=torch.device("cpu"), trainable=trainable)
+    return model
+
+
+def test_trainable_visual_joins_the_module_tree_and_receives_gradients(monkeypatch):
+    visual = _Visual()
+    model = _wire_trainable(monkeypatch, visual, "full")
+
+    model(
+        torch.tensor([[10, 99, 99, 20]]),
+        pixel_values=torch.ones(2, 4),
+        image_grid_thw=torch.tensor([[1, 2, 4]]),
+    ).sum().backward()
+
+    # Registered as a submodule, so Megatron's optimizer/DDP/checkpoint walks all see it.
+    assert model.visual is visual
+    assert "visual.projection.weight" in model.state_dict()
+    assert "visual.projection.weight" in dict(model.named_parameters())
+    assert visual.projection.weight.grad is not None
+    assert visual.projection.weight.grad.abs().sum() > 0
+    # The language model must still train, and image token rows stay out of the embedding grad.
+    assert model.output.weight.grad.abs().sum() > 0
+    assert model.embedding.weight.grad[99].abs().sum() == 0
+
+
+def test_frozen_visual_stays_out_of_the_module_tree(monkeypatch):
+    visual = _Visual()
+    model = _wire_trainable(monkeypatch, visual, "none")
+
+    assert not hasattr(model, "visual")
+    assert model.__dict__["_glm5_next_visual"] is visual
+    assert model.state_dict().keys() == {"embedding.weight", "output.weight"}
+
+
+def test_trainable_visual_follows_train_and_eval_mode(monkeypatch):
+    visual = _Visual()
+    model = _wire_trainable(monkeypatch, visual, "projector")
+
+    model.eval()
+    assert not visual.training
+    model.train()
+    assert visual.training
 
 
 def test_visual_wrapper_keeps_language_gradients_and_excludes_visual_from_checkpoint(wired_model):
@@ -223,6 +327,7 @@ def test_glm5_next_provider_decorates_default_model(monkeypatch):
     args = SimpleNamespace(
         hf_checkpoint="/checkpoint",
         context_parallel_size=1,
+        glm5_vision_trainable="projector",
         custom_model_provider_path="miles_plugins.models.glm5_next.vision.glm5_next_vlm_model_provider",
     )
     model = object()
@@ -244,7 +349,7 @@ def test_glm5_next_provider_decorates_default_model(monkeypatch):
     monkeypatch.setattr(
         vision_module,
         "wire_glm5_next_visual",
-        lambda wired_model, checkpoint: calls.append((wired_model, checkpoint)),
+        lambda wired_model, checkpoint, trainable: calls.append((wired_model, checkpoint, trainable)),
     )
 
     result = vision_module.glm5_next_vlm_model_provider(
@@ -260,7 +365,7 @@ def test_glm5_next_provider_decorates_default_model(monkeypatch):
     assert calls[0][1:] == ("actor", None)
     assert calls[1:] == [
         {"pre_process": False, "post_process": True, "vp_stage": 2},
-        (model, "/checkpoint"),
+        (model, "/checkpoint", "projector"),
     ]
 
 
@@ -284,3 +389,72 @@ def test_glm5_next_provider_rejects_unsupported_packing_and_cp(monkeypatch, over
 
     with pytest.raises(ValueError, match=message):
         vision_module.glm5_next_vlm_model_provider()
+
+
+@pytest.fixture
+def unwrapped_model_chunks(monkeypatch):
+    """Stub megatron.core.utils.unwrap_model, whose default unwrap list needs real Megatron."""
+    core_utils = ModuleType("megatron.core.utils")
+    core_utils.unwrap_model = lambda chunks: chunks if isinstance(chunks, list) else [chunks]
+    monkeypatch.setitem(sys.modules, "megatron.core.utils", core_utils)
+
+
+def _chunk_with_visual(config=None):
+    chunk = _LanguageModel()
+    chunk.add_module(vision_module.VISUAL_MODULE_NAME, Glm5NextVisionModel(config or _tiny_vision_config()))
+    return chunk
+
+
+def _write_checkpoint(tmp_path, keys):
+    import torch.distributed.checkpoint as dcp
+
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("1")
+    iteration_dir = tmp_path / "iter_0000001"
+    iteration_dir.mkdir()
+    dcp.save({key: torch.zeros(1) for key in keys}, checkpoint_id=str(iteration_dir))
+    return tmp_path
+
+
+def test_has_trainable_glm5_next_visual_detects_the_registered_tower(unwrapped_model_chunks):
+    assert vision_module.has_trainable_glm5_next_visual([_chunk_with_visual()])
+    assert not vision_module.has_trainable_glm5_next_visual([_LanguageModel()])
+
+
+def test_visual_is_hidden_while_loading_a_checkpoint_without_visual_weights(tmp_path, unwrapped_model_chunks):
+    load_dir = _write_checkpoint(tmp_path, ["embedding.weight"])
+    chunk = _chunk_with_visual()
+    visual = chunk.visual
+
+    with vision_module.hide_visual_missing_from_checkpoint([chunk], str(load_dir)):
+        assert not hasattr(chunk, vision_module.VISUAL_MODULE_NAME)
+        assert not any(name.startswith("visual.") for name in chunk.state_dict())
+
+    assert chunk.visual is visual
+
+
+def test_visual_stays_visible_when_the_checkpoint_carries_its_weights(tmp_path, unwrapped_model_chunks):
+    load_dir = _write_checkpoint(tmp_path, ["embedding.weight", "visual.merger.proj.weight"])
+    chunk = _chunk_with_visual()
+
+    with vision_module.hide_visual_missing_from_checkpoint([chunk], str(load_dir)):
+        assert chunk.visual is not None
+
+
+def test_hidden_visual_is_restored_when_the_load_raises(tmp_path, unwrapped_model_chunks):
+    load_dir = _write_checkpoint(tmp_path, ["embedding.weight"])
+    chunk = _chunk_with_visual()
+    visual = chunk.visual
+
+    with pytest.raises(RuntimeError, match="load failed"):
+        with vision_module.hide_visual_missing_from_checkpoint([chunk], str(load_dir)):
+            raise RuntimeError("load failed")
+
+    assert chunk.visual is visual
+
+
+@pytest.mark.parametrize("load_dir", (None, ""))
+def test_visual_is_kept_when_there_is_no_load_directory(load_dir, unwrapped_model_chunks):
+    chunk = _chunk_with_visual()
+
+    with vision_module.hide_visual_missing_from_checkpoint([chunk], load_dir):
+        assert chunk.visual is not None
