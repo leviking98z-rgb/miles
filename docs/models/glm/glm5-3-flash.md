@@ -203,8 +203,16 @@ visual parameters, the frozen visual parameters kept no gradient, and all ranks
 completed their optimizer updates. The distributed checkpoint held Adam state, RNG
 state and 347 `visual.*` entries, and `visual.merger.post_projection_norm.bias`
 changed across both the fresh and the resumed update. `--vision-trainable full`
-also completed a step with all 563,627,008 visual parameters trainable. This is a
-functional smoke test, not an image-task accuracy or convergence benchmark.
+also completed a step with all 563,627,008 visual parameters trainable.
+
+The full 45-layer model was then validated on 32 H20 GPUs at TP8/PP4/EP8/SP/CP1
+with `--vision-trainable projector`: one optimizer step, loss 5.0549, grad norm
+189.3484 identical on all 32 ranks. The eight first-pipeline-stage ranks each
+carried the tower with the same 159,396,864 trainable and 404,230,144 frozen
+parameters as the 4-layer slice, all with finite nonzero visual gradients, and
+all 32 ranks completed their optimizer update. The checkpoint holds 347
+`visual.*` entries alongside the optimizer and RNG state. These are functional
+smoke tests, not an image-task accuracy or convergence benchmark.
 
 ### Limits And Resume
 
@@ -224,5 +232,7 @@ functional smoke test, not an image-task accuracy or convergence benchmark.
 - Reuse the same `--output-dir` and HF checkpoint to resume. Language weights,
   trainable visual weights, optimizer state, and RNG are saved and restored
   normally.
-- The full-model topology reuses the text-training recipe. A 4-layer smoke
-  validates the image path, not full-model convergence or throughput.
+- The full-model topology reuses the text-training recipe. Both the 4-layer slice
+  and the full 45-layer model are validated for startup, gradients and
+  checkpointing only; neither measures convergence, image-task accuracy or
+  throughput.
