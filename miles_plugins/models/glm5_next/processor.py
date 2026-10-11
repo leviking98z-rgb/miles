@@ -1,4 +1,5 @@
-# Copyright 2026 the HuggingFace Team. All rights reserved.
+# Adapted from https://github.com/huggingface/transformers/blob/v5.12.1/src/transformers/models/glm46v/image_processing_glm46v.py
+# Copyright 2025 the HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
