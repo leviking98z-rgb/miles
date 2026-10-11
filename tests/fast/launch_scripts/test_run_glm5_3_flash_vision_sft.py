@@ -39,6 +39,9 @@ def test_image_sft_launcher_has_training_only_model_contract(monkeypatch, model_
     assert argv[argv.index("--expert-model-parallel-size") + 1] == ep
     assert not any(flag.startswith("--sglang-") for flag in argv)
     assert "--no-save-optim" not in argv
+    # Comparing two --vision-trainable scopes needs both to shuffle the data identically,
+    # so the seed is pinned in the command rather than left to the caller to remember.
+    assert argv[argv.index("--rollout-seed") + 1] == "42"
 
 
 def test_image_sft_launcher_uses_configured_checkpoint_and_dataset_paths(monkeypatch, tmp_path):

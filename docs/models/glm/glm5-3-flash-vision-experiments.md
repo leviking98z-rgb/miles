@@ -53,6 +53,26 @@ MILES_SCRIPT_EXTERNAL_RAY=1 python scripts/run_glm5_3_flash_vision_sft.py \
 Swap `--vision-trainable full` and the output directory for the second arm; the
 launcher adds `--glm5-vision-recompute` for that scope on its own.
 
+What makes the two arms comparable is `--rollout-seed`, which seeds the shuffle in
+`DataSource` and so fixes the order the samples arrive in. The launcher pins it at
+42 rather than inheriting the parser default, so the arms share a data order
+without the caller having to arrange it.
+
+The runs behind the numbers were launched with two extra flags that this command
+drops, because neither reaches the arithmetic:
+
+- `--seed 42`, which replaces Megatron's default 1234. It seeds weight init and
+  dropout; this recipe loads every weight from a checkpoint and sets both dropout
+  rates to 0, so nothing consumes it. It is not what orders the data.
+- `--seq-length 2048`, which only sizes `max_position_embeddings`. Training is
+  packed `thd` with `variable_seq_lengths`, and rope derives its table length from
+  the batch at runtime, so the value is a placeholder.
+
+They also used `--spec glm5_next_optimizer_cache_compat`, an out-of-tree wrapper
+that released the CUDA cache before the optimizer was built. That release now
+lives in `setup_model_and_optimizer`, so the repository covers it and the command
+above needs no custom spec.
+
 Only the visual shard of the HF checkpoint is read (all 347 `model.visual.*`
 tensors live in `model-00062-of-00062.safetensors`), so `--hf-checkpoint` does not
 need the full 306 GB export. The language weights come from `--ref-load`.
@@ -82,6 +102,17 @@ assistant target is `f"Answer: \\boxed{{{row['answer']}}}"`.
 
 Any dataset in this shape reproduces the run; the numbers above are specific to
 this one.
+
+### How closely this reproduces
+
+The commands and the repository are enough to re-run both arms and get the same
+shape of result: a fall from ~3.7 to ~0.2-0.3 over the epoch, no divergence, a
+loadable checkpoint. The comparison between arms holds because they share a seed.
+
+Exact per-step values will not match. BF16 reductions are not associative, so a
+different GPU count, micro-batch split or container build reorders them; the runs
+above were on 32xH20 under one pinned image. Treat the CSV as the trace of one
+run, not a target to diff against.
 
 ## 2. Zero-shot baseline, for context
 

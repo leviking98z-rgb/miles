@@ -14,6 +14,7 @@ Args:
   --output-dir: Training checkpoint destination; reused for resume.
   --save-interval: Checkpoint interval in optimizer steps.
   --vision-trainable: Visual parameters to train; none, projector or full.
+  --rollout-seed: Data shuffle seed; two runs must share it to be comparable.
   --optimizer-cpu-offload: Offload Adam states to host RAM.
   --rotary-base: Override the RoPE value read from local checkpoint metadata.
 
@@ -67,6 +68,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     rollout_batch_size: int = 16
     global_batch_size: int = 16
     max_tokens_per_gpu: int = 8192
+    rollout_seed: int = 42
     save_interval: int = 100
     lr: float = 1e-5
     rotary_base: int | None = None
@@ -135,7 +137,9 @@ def execute(args: ScriptArgs):
         "--rollout-function-path miles.rollout.sft_rollout.generate_rollout "
         f"--prompt-data {shlex.quote(args.prompt_data)} --input-key messages "
         """--multimodal-keys '{"image":"images"}' """
-        "--loss-mask-type glm5 --rollout-shuffle "
+        # The shuffle seed is what makes two runs see the same data in the same order,
+        # which any comparison between --vision-trainable scopes depends on.
+        f"--loss-mask-type glm5 --rollout-shuffle --rollout-seed {args.rollout_seed} "
         f"--num-rollout {args.num_rollout} --rollout-batch-size {args.rollout_batch_size} "
         f"--global-batch-size {args.global_batch_size} "
         "--n-samples-per-prompt 1 --num-steps-per-rollout 1 "

@@ -200,6 +200,11 @@ def setup_model_and_optimizer(
         config.defer_main_param_initialization = True
     config.timers = None
 
+    # Building parameter groups makes NCCL allocate a native CUDA buffer, which cannot come out of
+    # PyTorch's caching allocator. Model construction can leave that allocator holding most of the
+    # device, so hand the unused blocks back first. Allocator-only: no effect on any number.
+    clear_memory()
+
     if _is_muon_optimizer(config.optimizer):
         if args.stream_optimizer_state_to_disk:
             from miles_plugins.optimizers.nvme_stream import setup_muon_state_on_disk
