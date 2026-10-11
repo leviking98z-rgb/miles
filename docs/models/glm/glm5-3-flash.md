@@ -120,6 +120,12 @@ model, or evaluation is started.
 | `projector` (default) | `post_layernorm`, `downsample`, `merger` | 159,396,864 |
 | `full` | also `patch_embed` and the 24 ViT blocks | 563,627,008 |
 
+`full` also needs `--glm5-vision-recompute`, which the launcher sets for that scope:
+at GEO3K's image sizes the 24 ViT blocks hold about 5 GiB of activations per rank,
+which overflows a 95 GiB H20, and recomputing them costs about 1.3 GiB instead.
+(Transformers declares `supports_gradient_checkpointing` for this tower but never
+calls `_gradient_checkpointing_func`, so its own switch is inert.)
+
 With `none` the tower stays outside the optimizer and the distributed checkpoint.
 Any other scope registers it as the `visual` submodule, so its trainable
 parameters join the optimizer, the DDP gradient buckets and the checkpoint, and
@@ -211,7 +217,17 @@ with `--vision-trainable projector`: one optimizer step, loss 5.0549, grad norm
 carried the tower with the same 159,396,864 trainable and 404,230,144 frozen
 parameters as the 4-layer slice, all with finite nonzero visual gradients, and
 all 32 ranks completed their optimizer update. The checkpoint holds 347
-`visual.*` entries alongside the optimizer and RNG state. These are functional
+`visual.*` entries alongside the optimizer and RNG state.
+
+The full model also trained an epoch per scope on 2101 GEO3K image-text samples
+(65 steps at a global batch of 32, same seed and data in both runs, 32 H20 GPUs).
+Loss fell from 3.768 to 0.264 with `--vision-trainable none` and from 3.696 to
+0.285 with `full`, both saving their checkpoint. That confirms each scope trains
+without diverging; it does not rank them, because the scopes differ by 563,627,008
+trainable parameters and the GEO3K targets are a bare `Answer: \boxed{...}` line,
+which is easy to fit and says nothing about whether the geometry reasoning improved.
+
+These are functional
 smoke tests, not an image-task accuracy or convergence benchmark.
 
 ### Limits And Resume

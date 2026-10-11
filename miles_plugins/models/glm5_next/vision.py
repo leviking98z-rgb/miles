@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from safetensors import safe_open
+from torch.utils.checkpoint import checkpoint
 from transformers.models.glm_ocr.modeling_glm_ocr import (
     GlmOcrVisionBlock,
     GlmOcrVisionMlp,
@@ -87,12 +88,34 @@ class Glm5NextVisionPatchMerger(GlmOcrVisionPatchMerger):
         return self.down_proj(self.act_fn(gate) * up)
 
 
+class _RecomputingVisionBlock(Glm5NextVisionBlock):
+    """A ViT block that recomputes its activations in the backward pass.
+
+    Subclassing rather than wrapping keeps the parameter names -- and with them the optimizer
+    and checkpoint keys -- byte-identical to the non-recomputing block.
+    """
+
+    def forward(self, hidden_states: torch.Tensor, **kwargs):
+        if not (torch.is_grad_enabled() and hidden_states.requires_grad):
+            return super().forward(hidden_states, **kwargs)
+        return checkpoint(
+            lambda states: super(_RecomputingVisionBlock, self).forward(states, **kwargs),
+            hidden_states,
+            use_reentrant=False,
+        )
+
+
 class Glm5NextVisionModel(GlmOcrVisionModel):
     """Vision-only portion of the upstream GLM-5.3 model."""
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, *, recompute_blocks: bool = False) -> None:
         super().__init__(config)
-        self.blocks = torch.nn.ModuleList(Glm5NextVisionBlock(config) for _ in range(config.depth))
+        # Transformers declares supports_gradient_checkpointing for this model but never calls
+        # _gradient_checkpointing_func, so gradient_checkpointing_enable() is a no-op here.
+        # Choosing the block class is what trades compute for activation memory, and the
+        # upstream forward -- which only iterates self.blocks -- stays untouched.
+        block_class = _RecomputingVisionBlock if recompute_blocks else Glm5NextVisionBlock
+        self.blocks = torch.nn.ModuleList(block_class(config) for _ in range(config.depth))
         self.merger = Glm5NextVisionPatchMerger(config)
 
 
@@ -178,13 +201,14 @@ def build_glm5_next_visual(
     dtype: torch.dtype,
     trainable: str = "none",
     sequence_parallel: bool = False,
+    recompute_blocks: bool = False,
 ) -> Glm5NextVisionModel:
     """Construct and strictly load the checkpoint's visual tower."""
     hf_config = load_hf_config(hf_checkpoint)
     vision_config = hf_config.vision_config
     vision_config._attn_implementation = "sdpa"
     with torch.device(device), _default_dtype(dtype):
-        visual = Glm5NextVisionModel(vision_config)
+        visual = Glm5NextVisionModel(vision_config, recompute_blocks=recompute_blocks)
 
     visual.load_state_dict(_load_visual_state_dict(hf_checkpoint), strict=True)
     _apply_trainable_scope(visual, trainable, sequence_parallel=sequence_parallel)
@@ -242,6 +266,7 @@ def wire_glm5_next_visual(
     *,
     device: torch.device | None = None,
     trainable: str = "none",
+    recompute_blocks: bool = False,
 ) -> None:
     """Attach image encoding while leaving language parameter names unchanged.
 
@@ -268,6 +293,8 @@ def wire_glm5_next_visual(
         dtype=model.config.params_dtype,
         trainable=trainable,
         sequence_parallel=model.config.sequence_parallel,
+        # Only "full" trains the ViT blocks, so only it stores their activations.
+        recompute_blocks=recompute_blocks and trainable == "full",
     )
     train_visual = trainable != "none"
     if train_visual:
@@ -405,5 +432,10 @@ def glm5_next_vlm_model_provider(
     base_provider = get_model_provider_func(provider_args, role="actor")
 
     model = base_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-    wire_glm5_next_visual(model, args.hf_checkpoint, trainable=getattr(args, "glm5_vision_trainable", "none"))
+    wire_glm5_next_visual(
+        model,
+        args.hf_checkpoint,
+        trainable=getattr(args, "glm5_vision_trainable", "none"),
+        recompute_blocks=getattr(args, "glm5_vision_recompute", False),
+    )
     return model

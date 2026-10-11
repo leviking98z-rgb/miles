@@ -43,6 +43,28 @@ def test_glm5_next_visual_tower_emits_one_embedding_per_merged_patch():
     assert output.isfinite().all()
 
 
+def test_recomputing_blocks_match_the_plain_tower_exactly():
+    """Recomputation must change only memory, not names or numbers."""
+    config = _tiny_vision_config()
+    plain = Glm5NextVisionModel(config)
+    recomputing = Glm5NextVisionModel(config, recompute_blocks=True)
+    recomputing.load_state_dict(plain.state_dict(), strict=True)
+    assert [name for name, _ in plain.named_parameters()] == [name for name, _ in recomputing.named_parameters()]
+
+    image_grid_thw = torch.tensor([[1, 2, 4]])
+    patches = torch.randn(8, config.in_channels * config.temporal_patch_size * config.patch_size**2)
+    outputs = []
+    for model in (plain, recomputing):
+        # requires_grad is what selects the recompute path, so the comparison must use it.
+        pixel_values = patches.clone().requires_grad_(True)
+        output = model(pixel_values, grid_thw=image_grid_thw).pooler_output
+        output.sum().backward()
+        outputs.append((output, pixel_values.grad, model.blocks[0].attn.proj.weight.grad))
+
+    for plain_tensor, recomputed_tensor in zip(outputs[0], outputs[1], strict=True):
+        torch.testing.assert_close(plain_tensor, recomputed_tensor)
+
+
 def test_build_glm5_next_visual_loads_strictly_and_freezes(tmp_path, monkeypatch):
     config = _tiny_vision_config()
     reference = Glm5NextVisionModel(config)
@@ -328,6 +350,7 @@ def test_glm5_next_provider_decorates_default_model(monkeypatch):
         hf_checkpoint="/checkpoint",
         context_parallel_size=1,
         glm5_vision_trainable="projector",
+        glm5_vision_recompute=True,
         custom_model_provider_path="miles_plugins.models.glm5_next.vision.glm5_next_vlm_model_provider",
     )
     model = object()
@@ -349,7 +372,9 @@ def test_glm5_next_provider_decorates_default_model(monkeypatch):
     monkeypatch.setattr(
         vision_module,
         "wire_glm5_next_visual",
-        lambda wired_model, checkpoint, trainable: calls.append((wired_model, checkpoint, trainable)),
+        lambda wired_model, checkpoint, trainable, recompute_blocks: calls.append(
+            (wired_model, checkpoint, trainable, recompute_blocks)
+        ),
     )
 
     result = vision_module.glm5_next_vlm_model_provider(
@@ -365,7 +390,7 @@ def test_glm5_next_provider_decorates_default_model(monkeypatch):
     assert calls[0][1:] == ("actor", None)
     assert calls[1:] == [
         {"pre_process": False, "post_process": True, "vp_stage": 2},
-        (model, "/checkpoint", "projector"),
+        (model, "/checkpoint", "projector", True),
     ]
 
 

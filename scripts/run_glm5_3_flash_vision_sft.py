@@ -113,8 +113,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
                 "--context-parallel-size 1 "
                 f"--expert-model-parallel-size {self.total_gpus // 4} --expert-tensor-parallel-size 1 "
             )
-        if self.total_gpus != 8:
-            raise ValueError("The 4-layer GLM-5.3 image SFT recipe requires 8 GPUs")
+        # TP2 x PP2 fixes the model-parallel group at 4 GPUs; the rest becomes data parallel.
+        if self.total_gpus < 8 or self.total_gpus % 4:
+            raise ValueError("The 4-layer GLM-5.3 image SFT recipe requires at least 8 GPUs, in multiples of 4")
         return (
             "--tensor-model-parallel-size 2 --sequence-parallel "
             "--pipeline-model-parallel-size 2 --context-parallel-size 1 "

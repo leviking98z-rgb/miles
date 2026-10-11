@@ -98,7 +98,9 @@ def test_image_sft_launcher_explicit_rotary_base_overrides_metadata(tmp_path):
 @pytest.mark.parametrize(
     "kwargs",
     (
-        {"num_nodes": 2},
+        # The 4-layer slice is TP2 x PP2, so its GPU count must stay a multiple of 4.
+        {"num_gpus_per_node": 6},
+        {"num_nodes": 1, "num_gpus_per_node": 4},
         {"model_name": "GLM-5.3-Flash", "num_nodes": 1},
         {"rollout_batch_size": 4, "global_batch_size": 8},
         {"num_rollout": 0},
@@ -110,3 +112,13 @@ def test_image_sft_launcher_rejects_unsupported_topology_and_batch(kwargs):
     with pytest.raises(ValueError):
         args = launcher.ScriptArgs(**kwargs)
         _ = args.parallel_args
+
+
+def test_image_sft_launcher_scales_the_slice_past_one_node():
+    """Extra nodes become data parallelism, which is what makes the slice usable for studies."""
+    launcher = import_launch_script(REPO_ROOT / "scripts/run_glm5_3_flash_vision_sft.py")
+
+    args = launcher.ScriptArgs(num_nodes=4, global_batch_size=32, rollout_batch_size=32)
+
+    assert args.data_parallel_size == 8
+    assert "--tensor-model-parallel-size 2" in args.parallel_args

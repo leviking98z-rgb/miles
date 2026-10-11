@@ -18,4 +18,14 @@ def add_glm5_next_vision_arguments(parser: ArgumentParser) -> ArgumentParser:
             "Any scope other than 'none' writes visual.* into the training checkpoint."
         ),
     )
+    group.add_argument(
+        "--glm5-vision-recompute",
+        action="store_true",
+        default=False,
+        help=(
+            "Recompute the ViT blocks' activations in the backward pass instead of storing them. "
+            "Only affects --glm5-vision-trainable full, which is the scope that trains those "
+            "blocks; trades compute for the activation memory the full tower would otherwise hold."
+        ),
+    )
     return parser
