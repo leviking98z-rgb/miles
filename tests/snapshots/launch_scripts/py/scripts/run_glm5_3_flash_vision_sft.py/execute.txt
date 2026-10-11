@@ -67,6 +67,7 @@ export no_proxy=127.0.0.1 && export PYTHONUNBUFFERED=1 && ray job submit
   --multimodal-keys '{"image":"images"}'
   --loss-mask-type glm5
   --rollout-shuffle
+  --rollout-seed 42
   --num-rollout 100
   --rollout-batch-size 16
   --global-batch-size 16
