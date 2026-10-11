@@ -111,6 +111,8 @@ covers the KDA, DSA and hyper-connection paths at once.
 `scripts/run_glm5_3_flash_vision_sft.py` trains GLM-5.3-Flash from image-text
 conversations. `--vision-trainable` selects how much of the visual tower trains
 alongside the language model; it defaults to `projector`.
+Measured runs, loss curves and their limits:
+[glm5-3-flash-vision-experiments.md](glm5-3-flash-vision-experiments.md).
 It runs `train_async.py --debug-train-only`: no generation, SGLang engine, reward
 model, or evaluation is started.
 
