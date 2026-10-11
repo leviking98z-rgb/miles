@@ -2,9 +2,10 @@ import json
 import shlex
 
 import pytest
-
+import typer
 from tests.fast.launch_scripts.py_harness import freeze_environment, import_launch_script, install_command_recorder
 from tests.fast.launch_scripts.sh_harness import REPO_ROOT
+from typer.testing import CliRunner
 
 from miles.utils.external_utils.command_utils.base_backend import BaseCommandBackend
 
@@ -158,3 +159,50 @@ def test_image_sft_launcher_lets_an_explicit_recompute_choice_win(monkeypatch, v
         launcher.execute(launcher.ScriptArgs(vision_trainable=vision_trainable, vision_recompute=requested))
         argv = shlex.split(calls[0]["train_args"])
         assert ("--glm5-vision-recompute" in argv) is requested
+
+
+@pytest.mark.parametrize(
+    ("argv", "recompute_expected"),
+    [
+        ([], False),
+        (["--vision-trainable", "none"], False),
+        (["--vision-trainable", "projector"], False),
+        (["--vision-trainable", "full"], True),
+        (["--vision-trainable", "full", "--no-vision-recompute"], False),
+        (["--vision-trainable", "full", "--vision-recompute"], True),
+        (["--vision-trainable", "projector", "--vision-recompute"], True),
+    ],
+)
+def test_image_sft_launcher_resolves_recompute_through_the_real_cli(monkeypatch, argv, recompute_expected):
+    """The tri-state default has to survive typer, not just direct ScriptArgs construction.
+
+    `vision_recompute: bool | None` is what lets an unset value mean "ask the scope", but the
+    documented override is a pair of command line switches. Nothing pins that typer renders
+    `bool | None` as `--vision-recompute` / `--no-vision-recompute` rather than, say, a flag
+    taking a value -- so the docs would be wrong and every direct-construction test would
+    still pass.
+    """
+    launcher = import_launch_script(REPO_ROOT / "scripts/run_glm5_3_flash_vision_sft.py")
+    calls = []
+    monkeypatch.setattr(BaseCommandBackend, "execute_train", lambda *args, **kwargs: calls.append(kwargs))
+    app = typer.Typer()
+    app.command()(launcher.main)
+
+    result = CliRunner().invoke(app, argv)
+
+    assert result.exit_code == 0, result.output
+    emitted = shlex.split(calls[0]["train_args"])
+    assert ("--glm5-vision-recompute" in emitted) is recompute_expected
+
+
+def test_image_sft_launcher_cli_offers_both_recompute_switches():
+    """The feature page tells the reader to pass these by name, so they have to exist."""
+    launcher = import_launch_script(REPO_ROOT / "scripts/run_glm5_3_flash_vision_sft.py")
+    app = typer.Typer()
+    app.command()(launcher.main)
+
+    # Rich wraps the help table to the terminal, so widen it before matching option names.
+    help_text = CliRunner(env={"COLUMNS": "200"}).invoke(app, ["--help"]).output
+
+    assert "--vision-recompute" in help_text
+    assert "--no-vision-recompute" in help_text
