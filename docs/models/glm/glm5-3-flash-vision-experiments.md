@@ -57,6 +57,32 @@ Only the visual shard of the HF checkpoint is read (all 347 `model.visual.*`
 tensors live in `model-00062-of-00062.safetensors`), so `--hf-checkpoint` does not
 need the full 306 GB export. The language weights come from `--ref-load`.
 
+### The data these runs used
+
+`train.jsonl` is GEO3K in the format
+[the feature page specifies](glm5-3-flash.md#dataset): one row per sample, with a
+`messages` conversation and an `images` list of readable paths.
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "Solve the following math problem step by step. The last line of your response should be of the form Answer: \\boxed{$Answer} where $Answer is the answer to the problem.\n\n<image>Find x."},
+    {"role": "assistant", "content": "Answer: \\boxed{48}"}
+  ],
+  "images": ["/root/datasets/geo3k/images_train/54b363a493f4b5a9.png"]
+}
+```
+
+Built from [`chenhegu/geo3k_imgurl`](https://huggingface.co/datasets/chenhegu/geo3k_imgurl)
+(2101 train / 601 test rows, one image each). Two things about that dataset are
+easy to get wrong: the decoded images are in `preprocessed_images`, not `images`
+(which holds base64 data URIs), and `problem` already carries its own `<image>`
+placeholder and `\boxed{}` instruction, so neither needs to be added. The
+assistant target is `f"Answer: \\boxed{{{row['answer']}}}"`.
+
+Any dataset in this shape reproduces the run; the numbers above are specific to
+this one.
+
 ## 2. Zero-shot baseline, for context
 
 The same 45-layer model on GEO3K's 601 test rows, untrained, greedy, 2048 new
