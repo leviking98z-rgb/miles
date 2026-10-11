@@ -122,7 +122,8 @@ model, or evaluation is started.
 | `projector` (default) | `post_layernorm`, `downsample`, `merger` | 159,396,864 |
 | `full` | also `patch_embed` and the 24 ViT blocks | 563,627,008 |
 
-`full` also needs `--glm5-vision-recompute`, which the launcher sets for that scope:
+`full` also needs `--glm5-vision-recompute`, which the launcher sets for that scope
+(pass `--vision-recompute` / `--no-vision-recompute` to override):
 at GEO3K's image sizes the 24 ViT blocks hold about 5 GiB of activations per rank,
 which overflows a 95 GiB H20, and recomputing them costs about 1.3 GiB instead.
 (Transformers declares `supports_gradient_checkpointing` for this tower but never

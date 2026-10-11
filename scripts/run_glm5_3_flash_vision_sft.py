@@ -14,6 +14,10 @@ Args:
   --output-dir: Training checkpoint destination; reused for resume.
   --save-interval: Checkpoint interval in optimizer steps.
   --vision-trainable: Visual parameters to train; none, projector or full.
+  --vision-recompute: Recompute the ViT blocks instead of storing their
+    activations. Defaults to on for --vision-trainable full, which is the only
+    scope that trains those blocks and the only one whose activations overflow a
+    95 GiB card at realistic image sizes.
   --rollout-seed: Data shuffle seed; two runs must share it to be comparable.
   --optimizer-cpu-offload: Offload Adam states to host RAM.
   --rotary-base: Override the RoPE value read from local checkpoint metadata.
@@ -73,6 +77,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     lr: float = 1e-5
     rotary_base: int | None = None
     vision_trainable: Literal["none", "projector", "full"] = "projector"
+    # None resolves to the scope's default in __post_init__; set it explicitly to override.
+    vision_recompute: bool | None = None
     optimizer_cpu_offload: bool = True
     extra_args: str = ""
 
@@ -80,6 +86,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
         self.hf_checkpoint = self.hf_checkpoint or f"{self.model_dir}/{self.model_name}-BF16"
         self.ref_load = self.ref_load or f"{self.model_dir}/{self.megatron_model_type}_torch_dist"
         self.prompt_data = self.prompt_data or f"{self.data_dir}/glm53_image_sft.jsonl"
+        if self.vision_recompute is None:
+            # Only "full" trains the ViT blocks, and at realistic image sizes their stored
+            # activations overflow a 95 GiB card, so that scope needs recomputation to fit.
+            self.vision_recompute = self.vision_trainable == "full"
         self.rotary_base = (
             self.rotary_base if self.rotary_base is not None else _checkpoint_rotary_base(self.hf_checkpoint)
         )
@@ -163,6 +173,7 @@ def execute(args: ScriptArgs):
         f"--rotary-base {args.rotary_base} "
         "--custom-model-provider-path miles_plugins.models.glm5_next.vision.glm5_next_vlm_model_provider "
         f"--glm5-vision-trainable {args.vision_trainable} "
+        f"{'--glm5-vision-recompute ' if args.vision_recompute else ''}"
         "--model-name glm5_next --qkv-format thd "
         "--attention-dropout 0.0 --hidden-dropout 0.0 "
         "--attention-softmax-in-fp32 --accumulate-allreduce-grads-in-fp32 "

@@ -125,3 +125,36 @@ def test_image_sft_launcher_scales_the_slice_past_one_node():
 
     assert args.data_parallel_size == 8
     assert "--tensor-model-parallel-size 2" in args.parallel_args
+
+
+@pytest.mark.parametrize(
+    ("vision_trainable", "recompute_expected"),
+    [("none", False), ("projector", False), ("full", True)],
+)
+def test_image_sft_launcher_recomputes_the_vit_blocks_for_the_full_scope(
+    monkeypatch, vision_trainable, recompute_expected
+):
+    """`full` is the only scope that trains the ViT blocks, and it does not fit without this."""
+    launcher = import_launch_script(REPO_ROOT / "scripts/run_glm5_3_flash_vision_sft.py")
+    calls = []
+    monkeypatch.setattr(BaseCommandBackend, "execute_train", lambda *args, **kwargs: calls.append(kwargs))
+
+    launcher.execute(launcher.ScriptArgs(vision_trainable=vision_trainable))
+
+    argv = shlex.split(calls[0]["train_args"])
+    assert argv[argv.index("--glm5-vision-trainable") + 1] == vision_trainable
+    assert ("--glm5-vision-recompute" in argv) is recompute_expected
+
+
+@pytest.mark.parametrize("vision_trainable", ["projector", "full"])
+def test_image_sft_launcher_lets_an_explicit_recompute_choice_win(monkeypatch, vision_trainable):
+    """A card with room to spare can turn it off; a smaller one can turn it on for any scope."""
+    launcher = import_launch_script(REPO_ROOT / "scripts/run_glm5_3_flash_vision_sft.py")
+    calls = []
+    monkeypatch.setattr(BaseCommandBackend, "execute_train", lambda *args, **kwargs: calls.append(kwargs))
+
+    for requested in (True, False):
+        calls.clear()
+        launcher.execute(launcher.ScriptArgs(vision_trainable=vision_trainable, vision_recompute=requested))
+        argv = shlex.split(calls[0]["train_args"])
+        assert ("--glm5-vision-recompute" in argv) is requested
