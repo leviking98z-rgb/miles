@@ -93,6 +93,12 @@ class _RecomputingVisionBlock(Glm5NextVisionBlock):
 
     Subclassing rather than wrapping keeps the parameter names -- and with them the optimizer
     and checkpoint keys -- byte-identical to the non-recomputing block.
+
+    Transformers' own ``gradient_checkpointing_enable()`` does reach these blocks:
+    ``GlmOcrVisionBlock`` inherits ``GradientCheckpointingLayer``, whose ``__call__``
+    dispatches to ``_gradient_checkpointing_func``. It gates on ``self.training`` alone,
+    though, so it also wraps forwards whose result no backward pass will consume. Gating on
+    the autograd state keeps the cost where the gradient is.
     """
 
     def forward(self, hidden_states: torch.Tensor, **kwargs):
@@ -110,10 +116,10 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
 
     def __init__(self, config, *, recompute_blocks: bool = False) -> None:
         super().__init__(config)
-        # Transformers declares supports_gradient_checkpointing for this model but never calls
-        # _gradient_checkpointing_func, so gradient_checkpointing_enable() is a no-op here.
-        # Choosing the block class is what trades compute for activation memory, and the
-        # upstream forward -- which only iterates self.blocks -- stays untouched.
+        # Selecting the block class, rather than calling gradient_checkpointing_enable(),
+        # keeps the recompute decision tied to the trainable scope and the autograd state
+        # (see _RecomputingVisionBlock). Either way the upstream forward -- which only
+        # iterates self.blocks -- stays untouched.
         block_class = _RecomputingVisionBlock if recompute_blocks else Glm5NextVisionBlock
         self.blocks = torch.nn.ModuleList(block_class(config) for _ in range(config.depth))
         self.merger = Glm5NextVisionPatchMerger(config)

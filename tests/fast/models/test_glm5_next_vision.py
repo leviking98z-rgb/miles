@@ -65,6 +65,58 @@ def test_recomputing_blocks_match_the_plain_tower_exactly():
         torch.testing.assert_close(plain_tensor, recomputed_tensor)
 
 
+def test_upstream_gradient_checkpointing_reaches_the_blocks_but_gates_only_on_training_mode(monkeypatch):
+    """Records why this module selects a block class instead of calling Transformers' switch.
+
+    The switch is not inert: ``GlmOcrVisionBlock`` inherits ``GradientCheckpointingLayer``,
+    whose ``__call__`` dispatches to ``_gradient_checkpointing_func``. Grepping
+    ``modeling_glm_ocr.py`` alone misses that, since the call lives in the base class. What
+    it does gate on is ``self.training`` and nothing else, so it keeps paying for the wrapper
+    on a forward whose activations no backward pass will ever read back.
+    """
+    config = _tiny_vision_config()
+    upstream = Glm5NextVisionModel(config)
+    upstream.gradient_checkpointing_enable()
+    assert [block.gradient_checkpointing for block in upstream.blocks] == [True] * config.depth
+
+    recomputing = Glm5NextVisionModel(config, recompute_blocks=True)
+    recomputing.load_state_dict(upstream.state_dict(), strict=True)
+
+    upstream_wraps = []
+    for block in upstream.blocks:
+        inner = block._gradient_checkpointing_func
+        block._gradient_checkpointing_func = lambda function, *args, _inner=inner: upstream_wraps.append(1) or _inner(
+            function, *args
+        )
+    miles_wraps = []
+    real_checkpoint = vision_module.checkpoint
+    monkeypatch.setattr(
+        vision_module,
+        "checkpoint",
+        lambda function, *args, **kwargs: miles_wraps.append(1) or real_checkpoint(function, *args, **kwargs),
+    )
+
+    image_grid_thw = torch.tensor([[1, 2, 4]])
+    patches = torch.randn(8, config.in_channels * config.temporal_patch_size * config.patch_size**2)
+    upstream.train()
+    recomputing.train()
+
+    # A real training step: both recompute, once per block.
+    upstream(patches.clone().requires_grad_(True), grid_thw=image_grid_thw)
+    recomputing(patches.clone().requires_grad_(True), grid_thw=image_grid_thw)
+    assert len(upstream_wraps) == config.depth
+    assert len(miles_wraps) == config.depth
+
+    # Still in training mode, but under no_grad there is nothing to recompute for.
+    upstream_wraps.clear()
+    miles_wraps.clear()
+    with torch.no_grad():
+        upstream(patches.clone(), grid_thw=image_grid_thw)
+        recomputing(patches.clone(), grid_thw=image_grid_thw)
+    assert len(upstream_wraps) == config.depth, "upstream gates on training mode alone"
+    assert miles_wraps == [], "the recomputing block gates on the autograd state too"
+
+
 def test_build_glm5_next_visual_loads_strictly_and_freezes(tmp_path, monkeypatch):
     config = _tiny_vision_config()
     reference = Glm5NextVisionModel(config)

@@ -126,8 +126,10 @@ model, or evaluation is started.
 (pass `--vision-recompute` / `--no-vision-recompute` to override):
 at GEO3K's image sizes the 24 ViT blocks hold about 5 GiB of activations per rank,
 which overflows a 95 GiB H20, and recomputing them costs about 1.3 GiB instead.
-(Transformers declares `supports_gradient_checkpointing` for this tower but never
-calls `_gradient_checkpointing_func`, so its own switch is inert.)
+(Transformers' own `gradient_checkpointing_enable()` does reach this tower, but it
+gates on training mode alone and so also wraps forwards no backward pass consumes.
+Miles selects a recomputing block class instead, which ties the cost to the
+trainable scope and the autograd state; the two produce identical numbers.)
 
 With `none` the tower stays outside the optimizer and the distributed checkpoint.
 Any other scope registers it as the `visual` submodule, so its trainable
