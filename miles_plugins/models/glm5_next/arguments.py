@@ -1,8 +1,23 @@
-"""Launch arguments for GLM-5.3 image SFT."""
+"""Launch arguments for GLM-5.3 image SFT.
+
+Deliberately free of heavy imports. `miles.utils.arguments` reaches this module while
+building the parser for *every* Megatron run, so pulling the visual tower in from here
+would make every model pay for -- and depend on -- the Transformers GLM-OCR modeling code.
+`vision.py` imports the scope names from here rather than the other way round.
+"""
 
 from argparse import ArgumentParser
 
-from miles_plugins.models.glm5_next.vision import VISION_TRAINABLE_CHOICES
+# Trainable scopes, ordered from smallest to largest.
+VISION_TRAINABLE_CHOICES = ("none", "projector", "full")
+
+
+def vision_scope_may_register_tower(args) -> bool:
+    """Whether the requested scope puts the visual tower in the module tree.
+
+    Lets callers on shared code paths decide whether to import the tower at all.
+    """
+    return getattr(args, "glm5_vision_trainable", "none") != "none"
 
 
 def add_glm5_next_vision_arguments(parser: ArgumentParser) -> ArgumentParser:

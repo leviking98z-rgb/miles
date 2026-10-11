@@ -35,6 +35,10 @@ from transformers.models.glm_ocr.modeling_glm_ocr import (
 
 from miles.utils.hf_utils.config import load_hf_config
 
+# Imported from the argparse module, not defined here: that module must stay importable
+# without pulling this one in, since the parser is built for every Megatron run.
+from miles_plugins.models.glm5_next.arguments import VISION_TRAINABLE_CHOICES
+
 if TYPE_CHECKING:
     from megatron.core.models.gpt import GPTModel
 
@@ -45,9 +49,6 @@ _VISUAL_PREFIX = "model.visual."
 # Attribute name of the visual tower once it is a real submodule, which is also the
 # ``visual.*`` prefix its parameters take in the optimizer and the distributed checkpoint.
 VISUAL_MODULE_NAME = "visual"
-
-# Trainable scopes, ordered from smallest to largest.
-VISION_TRAINABLE_CHOICES = ("none", "projector", "full")
 
 # The image-feature projection that runs after the ViT blocks. ``patch_embed`` and
 # ``blocks`` are the pretrained encoder itself and stay frozen unless "full" is requested.

@@ -970,6 +970,31 @@ class LoadCheckpointOutput:
     start_rollout_id: int
 
 
+def _glm5_next_visual_load_context(args: Namespace, model):
+    """Hide a trainable GLM-5.3 visual tower from a checkpoint that predates it.
+
+    Gated on the requested scope rather than on the module tree, because reading the tree
+    means importing the tower: this runs for every non-multi-LoRA Megatron load, and the
+    plugin pulls in the Transformers GLM-OCR modeling code (~1200 modules, ~1s), which would
+    make every model in the repo depend on a module only GLM-5.3 image SFT needs.
+    """
+    from miles_plugins.models.glm5_next.arguments import vision_scope_may_register_tower
+
+    if not vision_scope_may_register_tower(args):
+        return nullcontext()
+
+    from miles_plugins.models.glm5_next.vision import (
+        has_trainable_glm5_next_visual,
+        hide_visual_missing_from_checkpoint,
+    )
+
+    if not has_trainable_glm5_next_visual(model):
+        return nullcontext()
+    # A fresh image-SFT run loads the language-only conversion, which has no visual.*
+    # entries; hide the tower so those keys don't reach the load as unexpected.
+    return hide_visual_missing_from_checkpoint(model, getattr(args, "load", None))
+
+
 def load_model_state(
     args: Namespace,
     *,
@@ -986,17 +1011,7 @@ def load_model_state(
 
         load_ctx = hide_adapters(model)
     else:
-        from miles_plugins.models.glm5_next.vision import (
-            has_trainable_glm5_next_visual,
-            hide_visual_missing_from_checkpoint,
-        )
-
-        if has_trainable_glm5_next_visual(model):
-            # A fresh image-SFT run loads the language-only conversion, which has no visual.*
-            # entries; hide the tower so those keys don't reach the load as unexpected.
-            load_ctx = hide_visual_missing_from_checkpoint(model, getattr(args, "load", None))
-        else:
-            load_ctx = nullcontext()
+        load_ctx = _glm5_next_visual_load_context(args, model)
 
     load_dir = getattr(args, "load", None)
     native_optimizer_restored = False
