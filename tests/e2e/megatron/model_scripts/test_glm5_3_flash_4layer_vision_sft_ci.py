@@ -9,6 +9,18 @@ saved checkpoints back.
 It trains twice against one output directory. The second launch is the point: by then
 the checkpoint already carries `visual.*`, so the load takes the branch that keeps the
 tower attached rather than the first-run branch that hides it.
+
+Two things to know before reading a failure here:
+
+`prepare()` has never run. Every expected value below was measured against an existing
+local copy of the checkpoint, so the download, the processor_config.json write and the
+conversion execute for the first time in CI. If this goes red on its first run, start
+there rather than with the assertions.
+
+`--optimizer-cpu-offload` pins host memory. The run those numbers come from raised
+RLIMIT_MEMLOCK first, outside the repository; nothing here does. A 64 KiB limit on the
+runner surfaces as `CUDA error: invalid argument` from pin_memory(), which is a runner
+image to fix rather than something to work around in this file.
 """
 
 import dataclasses
@@ -152,7 +164,17 @@ def _metadata(checkpoints: Path, iteration: int):
 
 
 def _small_float_tensors(metadata, prefixes) -> list[str]:
-    """Parameters small enough to load whole, so a comparison stays cheap."""
+    """Parameters small enough to load whole, so a comparison stays cheap.
+
+    This threshold is a coverage boundary as much as a speed one, and the split is not
+    arbitrary: of the 338 frozen visual parameters it admits 217 -- every bias and every
+    RMSNorm scale -- and excludes 121, which are exactly the projection weights
+    (`blocks.N.attn.qkv/proj`, `blocks.N.mlp.{gate,up,down}_proj`, `patch_embed.proj`).
+    So no bias and no norm scale goes unchecked, and not one projection weight is
+    compared. Those counts follow from vision_config alone, so they can be recomputed
+    without a checkpoint. Raising the threshold to cover them means re-measuring
+    est_time: the loaded bytes go up by two orders of magnitude.
+    """
     return [
         key
         for key, value in metadata.items()
