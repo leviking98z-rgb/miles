@@ -169,7 +169,8 @@ def _float_tensors(metadata, prefixes) -> list[str]:
     An earlier version skipped tensors over 65536 elements to keep the reads small. That
     was the wrong trade: it left 0.008% of the projector and 0.092% of the frozen tower
     actually compared, because the excluded tensors are precisely the weight matrices.
-    Reading all of them costs 252s of the ~1350s this file takes, measured on 8xH20.
+    Reading all of them is a fifth of this file's runtime; est_time above has the figure,
+    which is where it is measured and the only place it should be written down.
     """
     return [
         key
