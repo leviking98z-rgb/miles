@@ -77,19 +77,32 @@ class ScriptArgs(U.ExecuteTrainConfig):
     lr: float = 1e-5
     rotary_base: int | None = None
     vision_trainable: Literal["none", "projector", "full"] = "projector"
-    # None resolves to the scope's default in __post_init__; set it explicitly to override.
+    # None means "ask the scope"; resolved by resolved_vision_recompute, not in
+    # __post_init__, so copying this args object and changing a field still resolves.
     vision_recompute: bool | None = None
     optimizer_cpu_offload: bool = True
     extra_args: str = ""
+
+    @property
+    def resolved_vision_recompute(self) -> bool:
+        """Whether to recompute the ViT blocks, from the scope unless asked otherwise.
+
+        Deliberately not resolved in __post_init__. `dataclasses.replace(args,
+        vision_trainable="full")` runs __init__, then __post_init__ with the old
+        vision_recompute already copied over, so a field written there would leave the
+        override looking explicit and silently disable recomputation for the one scope
+        that cannot fit without it.
+        """
+        if self.vision_recompute is not None:
+            return self.vision_recompute
+        # Only "full" trains the ViT blocks, and at realistic image sizes their stored
+        # activations overflow a 95 GiB card, so that scope needs recomputation to fit.
+        return self.vision_trainable == "full"
 
     def __post_init__(self):
         self.hf_checkpoint = self.hf_checkpoint or f"{self.model_dir}/{self.model_name}-BF16"
         self.ref_load = self.ref_load or f"{self.model_dir}/{self.megatron_model_type}_torch_dist"
         self.prompt_data = self.prompt_data or f"{self.data_dir}/glm53_image_sft.jsonl"
-        if self.vision_recompute is None:
-            # Only "full" trains the ViT blocks, and at realistic image sizes their stored
-            # activations overflow a 95 GiB card, so that scope needs recomputation to fit.
-            self.vision_recompute = self.vision_trainable == "full"
         self.rotary_base = (
             self.rotary_base if self.rotary_base is not None else _checkpoint_rotary_base(self.hf_checkpoint)
         )
@@ -173,7 +186,7 @@ def execute(args: ScriptArgs):
         f"--rotary-base {args.rotary_base} "
         "--custom-model-provider-path miles_plugins.models.glm5_next.vision.glm5_next_vlm_model_provider "
         f"--glm5-vision-trainable {args.vision_trainable} "
-        f"{'--glm5-vision-recompute ' if args.vision_recompute else ''}"
+        f"{'--glm5-vision-recompute ' if args.resolved_vision_recompute else ''}"
         "--model-name glm5_next --qkv-format thd "
         "--attention-dropout 0.0 --hidden-dropout 0.0 "
         "--attention-softmax-in-fp32 --accumulate-allreduce-grads-in-fp32 "

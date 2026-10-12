@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import shlex
 
@@ -206,3 +207,35 @@ def test_image_sft_launcher_cli_offers_both_recompute_switches():
 
     assert "--vision-recompute" in help_text
     assert "--no-vision-recompute" in help_text
+
+
+@pytest.mark.parametrize(
+    ("replace_with", "recompute_expected"),
+    [
+        ({"vision_trainable": "none"}, False),
+        ({"vision_trainable": "projector"}, False),
+        ({"vision_trainable": "full"}, True),
+        ({"vision_trainable": "full", "vision_recompute": False}, False),
+        ({"vision_recompute": True}, True),
+    ],
+)
+def test_image_sft_launcher_resolves_recompute_through_dataclasses_replace(
+    monkeypatch, replace_with, recompute_expected
+):
+    """`dataclasses.replace` is how this repo copies args, and it re-runs __post_init__.
+
+    That is what makes resolving the default in __post_init__ unsafe: replace() initializes
+    every field from the source object -- so an already-resolved `vision_recompute` arrives
+    looking explicit -- and __post_init__ then sees a non-None value and leaves it. A
+    `replace(args, vision_trainable="full")` would silently drop recomputation for the one
+    scope that cannot fit without it. See `resolved_vision_recompute`.
+    """
+    launcher = import_launch_script(REPO_ROOT / "scripts/run_glm5_3_flash_vision_sft.py")
+    calls = []
+    monkeypatch.setattr(BaseCommandBackend, "execute_train", lambda *args, **kwargs: calls.append(kwargs))
+
+    base = launcher.ScriptArgs(vision_trainable="projector")
+    launcher.execute(dataclasses.replace(base, **replace_with))
+
+    argv = shlex.split(calls[0]["train_args"])
+    assert ("--glm5-vision-recompute" in argv) is recompute_expected
