@@ -114,22 +114,45 @@ different GPU count, micro-batch split or container build reorders them; the run
 above were on 32xH20 under one pinned image. Treat the CSV as the trace of one
 run, not a target to diff against.
 
-## 2. Zero-shot baseline, for context
+## 2. The zero-shot baseline is withdrawn
 
-The same 45-layer model on GEO3K's 601 test rows, untrained, greedy, 2048 new
-tokens:
+This page used to report a GEO3K zero-shot accuracy for the 45-layer model. **Those
+numbers are withdrawn: the evaluation never delivered the image to the model**, so they
+describe its text-only behaviour on geometry questions and say nothing about the visual
+tower.
 
-| | |
-|---|---|
-| exact-match accuracy | 6.82% (41/601) |
-| produced a `\boxed{}` | 34.9% (210/601) |
-| accuracy among those | **19.52%** (41/210) |
-| ran out of tokens | **65.1%** |
+What gave it away, in the stored predictions from that run:
 
-The model does real geometry - it writes a derivation and a `\boxed{}` answer -
-but its reasoning is long (median 6463 characters), so two thirds of the rows are
-cut off before the answer. At this token budget the headline number mostly
-measures whether a response finishes, not whether it is correct.
+- 155 of the 601 responses contain a `</image>` tag. The harness put the training
+  convention `<image>` into the prompt, which is a placeholder only the Miles processor
+  understands; reaching the model as literal text, it answered by closing the tag.
+- The responses narrate guessing rather than reading. One opens "There is image with
+  likely some lengths", another emits `[asy]` source inventing a diagram.
+
+Four separate defects in that harness, each confirmed against the checkpoint:
+
+1. The model's image token is `<|image|>` (id 154854). `<image>` is the processor's
+   input convention, not the model's.
+2. No chat template was applied, so the model continued the document instead of
+   answering it -- echoing the question back, starting a "Question 2.".
+3. The processor expands one `<|image|>` into one token per merged patch -- 682 of them
+   for a 1176x746 chart. Those are the slots the image embeddings fill. A prompt with a
+   single placeholder leaves the model nowhere to put the picture, and it says so: "I
+   don't see any image attached to this conversation."
+4. The chat template ends in `<think>`, so a short token budget is spent reasoning and
+   never reaches an answer.
+
+Note that defects 1 and 3 pull in opposite directions from SGLang's side: it ships its
+own GLM multimodal processor and expands the placeholder itself, so pre-expanding with
+the Miles processor *and* passing the images makes its loader reject the request.
+`miles/rollout/sglang_rollout.py` is the working reference -- processor-expanded
+`input_ids` plus base64 data URIs, posted to a server endpoint rather than driven
+through the Engine API.
+
+**No corrected number is given here on purpose.** The harness is not fixed yet, and a
+figure measured through a path that is known to drop the image would be worse than no
+figure. The training results in section 1 are unaffected: they come from the training
+path, which uses the processor directly and is covered by the e2e test.
 
 ## 3. What is not measured, and why GEO3K cannot measure it
 
@@ -138,8 +161,10 @@ quality**, and this dataset cannot provide it.
 
 GEO3K's prompt asks the model to "Solve the following math problem step by step",
 but its SFT target contains no steps - just `Answer: \boxed{48}`, a median of 18
-characters against the 6463 the model generates unprompted, a factor of 359. Training
-on it teaches the model to skip the reasoning the prompt asks for.
+characters. The prompt and the target disagree about what the answer is, and the
+target wins: training on it teaches the model to skip the reasoning the prompt asks
+for. That reading comes from the dataset alone, so unlike the withdrawn baseline above
+it does not depend on anything the evaluation harness measured.
 
 That matters for this comparison specifically: if the task collapses to emitting a
 short string, the image contributes little and the arms converge regardless of
@@ -158,4 +183,6 @@ run 195 steps on it.
 **Do not use it for anything that depends on model behaviour.** It cannot generate
 text - the untrained slice emits `Unload unload unload...` and a trained one emits
 `}}}}`, so task accuracy on it is identically zero and cannot separate any two
-configurations.
+configurations. That one survives the withdrawal above: a model emitting `}}}}` is
+broken whether or not an image reached it, so the conclusion rests on the output text
+rather than on the evaluation path.
