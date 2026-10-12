@@ -25,7 +25,6 @@ image to fix rather than something to work around in this file.
 
 import dataclasses
 import json
-import math
 import os
 from pathlib import Path
 
@@ -45,11 +44,12 @@ from tests.ci.metric_history import register_ci_gate
 #           relaxing that assert, which is exactly what the rules forbid.
 # hardware: hopper only. This recipe has only ever run on H20; claiming blackwell would
 #           be asserting a capability nobody has exercised.
-# est_time: measured on 8xH20, 1174s total -- hf download 143s (46 GB), conversion 163s,
-#           first launch 450s, resumed launch 338s, checkpoint assertions ~80s. Rounded up,
-#           since under-estimating packs this next to another heavy test in one shard.
+# est_time: measured on 8xH20, 1341s total -- hf download 143s (46 GB), conversion 163s,
+#           first launch 450s, resumed launch 338s, checkpoint comparison 247s (9 projector
+#           tensors in 7s, 338 frozen in 240s). Rounded up, since under-estimating packs
+#           this next to another heavy test in one shard.
 register_cuda_ci(
-    est_time=1200,
+    est_time=1400,
     suite="stage-c-8-gpu-h200",
     labels=["megatron", "model-scripts", "ckpt"],
     hardware=["hopper"],
@@ -163,24 +163,19 @@ def _metadata(checkpoints: Path, iteration: int):
     return dcp.FileSystemReader(checkpoints / f"iter_{iteration:07d}").read_metadata().state_dict_metadata
 
 
-def _small_float_tensors(metadata, prefixes) -> list[str]:
-    """Parameters small enough to load whole, so a comparison stays cheap.
+def _float_tensors(metadata, prefixes) -> list[str]:
+    """Every floating-point parameter under `prefixes`, weights included.
 
-    This threshold is a coverage boundary as much as a speed one, and the split is not
-    arbitrary: of the 338 frozen visual parameters it admits 217 -- every bias and every
-    RMSNorm scale -- and excludes 121, which are exactly the projection weights
-    (`blocks.N.attn.qkv/proj`, `blocks.N.mlp.{gate,up,down}_proj`, `patch_embed.proj`).
-    So no bias and no norm scale goes unchecked, and not one projection weight is
-    compared. Those counts follow from vision_config alone, so they can be recomputed
-    without a checkpoint. Raising the threshold to cover them means re-measuring
-    est_time: the loaded bytes go up by two orders of magnitude.
+    An earlier version skipped tensors over 65536 elements to keep the reads small. That
+    was the wrong trade: it left 0.008% of the projector and 0.092% of the frozen tower
+    actually compared, because the excluded tensors are precisely the weight matrices.
+    Reading all of them costs 252s of the ~1350s this file takes, measured on 8xH20.
     """
     return [
         key
         for key, value in metadata.items()
         if isinstance(value, TensorStorageMetadata)
         and key.startswith(prefixes)
-        and math.prod(value.size) <= 65536
         and value.properties.dtype.is_floating_point
         and "extra_state" not in key
     ]
@@ -258,13 +253,25 @@ def execute(args: ScriptArgs):
 
     # The trainable scope has to move, across the fresh step *and* the resumed one. A
     # tower that only updated before the restart would pass a weaker check.
-    trainable = _small_float_tensors(metadata, _PROJECTOR_PREFIXES)
+    trainable = _float_tensors(metadata, _PROJECTOR_PREFIXES)
     assert trainable, "projector parameters must be in the checkpoint"
     moved = {key: _max_abs_update(checkpoints, metadata, key, iterations) for key in trainable}
-    assert any(update > 0 for update in moved.values()), f"no projector parameter moved: {moved}"
 
-    # The frozen half is saved but must not move: "projector" has to mean projector.
-    frozen = _small_float_tensors(metadata, _FROZEN_PREFIXES)
+    # Every weight matrix must move -- those carry essentially all of the projector's
+    # 159,396,864 parameters, and they are what "the projector trained" has to mean.
+    # The 1-D RMSNorm scales are deliberately not required to: they sit at 1.0, where
+    # bf16 cannot represent the 3.81e-06 update the biases show, so they stay put while
+    # training is working perfectly. Asserting on them would make this test's outcome
+    # depend on the learning rate.
+    matrices = [key for key in trainable if len(metadata[key].size) > 1]
+    assert matrices, "the projector must contribute weight matrices"
+    unmoved = {key: moved[key] for key in matrices if moved[key] == 0}
+    assert not unmoved, f"projector weight matrices did not change: {unmoved}"
+
+    # The frozen half is saved but must not move: "projector" has to mean projector. This
+    # reads the ViT's own projection weights, which is what makes it an answer to "did the
+    # tower train when it should not have" rather than a statement about its norms.
+    frozen = _float_tensors(metadata, _FROZEN_PREFIXES)
     assert frozen, "frozen visual parameters must still be in the checkpoint"
     for key in frozen:
         update = _max_abs_update(checkpoints, metadata, key, iterations)
