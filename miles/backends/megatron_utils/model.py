@@ -200,6 +200,11 @@ def setup_model_and_optimizer(
         config.defer_main_param_initialization = True
     config.timers = None
 
+    # Building parameter groups makes NCCL allocate a native CUDA buffer, which cannot come out of
+    # PyTorch's caching allocator. Model construction can leave that allocator holding most of the
+    # device, so hand the unused blocks back first. Allocator-only: no effect on any number.
+    clear_memory()
+
     if _is_muon_optimizer(config.optimizer):
         if args.stream_optimizer_state_to_disk:
             from miles_plugins.optimizers.nvme_stream import setup_muon_state_on_disk
@@ -583,6 +588,11 @@ def train_one_step(
     disable_optimizer = args.debug_disable_optimizer or optimizer is None
     _zero_grads(model, optimizer, disable_optimizer)
 
+    if getattr(args, "glm5_visual_snapshot_only", False) is True:
+        from miles_plugins.models.glm5_next.visual_snapshot import before_train_step
+
+        before_train_step(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
+
     if args.custom_megatron_before_train_step_hook_path:
         from miles.utils.function_registry import load_function
 
@@ -894,6 +904,17 @@ def save(
         non_persistent_ckpt (bool): If True, save a non-persistent (in-memory) checkpoint.
     """
     args = get_args()
+    if getattr(args, "glm5_visual_snapshot_only", False) is True and not non_persistent_ckpt:
+        from miles_plugins.models.glm5_next.visual_snapshot import save_visual_snapshot
+
+        if should_disable_forward_pre_hook(args):
+            disable_forward_pre_hook(model)
+        try:
+            save_visual_snapshot(args, iteration, model)
+        finally:
+            if should_disable_forward_pre_hook(args):
+                enable_forward_pre_hook(model)
+        return
     hashes = None
     if args.ci_test and args.ci_save_model_hash:
         hashes = compute_model_hashes_by_layer(model)
@@ -965,6 +986,31 @@ class LoadCheckpointOutput:
     start_rollout_id: int
 
 
+def _glm5_next_visual_load_context(args: Namespace, model):
+    """Hide a trainable GLM-5.3 visual tower from a checkpoint that predates it.
+
+    Gated on the requested scope rather than on the module tree, because reading the tree
+    means importing the tower: this runs for every non-multi-LoRA Megatron load, and the
+    plugin pulls in the Transformers GLM-OCR modeling code (~1200 modules, ~1s), which would
+    make every model in the repo depend on a module only GLM-5.3 image SFT needs.
+    """
+    from miles_plugins.models.glm5_next.arguments import vision_scope_may_register_tower
+
+    if not vision_scope_may_register_tower(args):
+        return nullcontext()
+
+    from miles_plugins.models.glm5_next.vision import (
+        has_trainable_glm5_next_visual,
+        hide_visual_missing_from_checkpoint,
+    )
+
+    if not has_trainable_glm5_next_visual(model):
+        return nullcontext()
+    # A fresh image-SFT run loads the language-only conversion, which has no visual.*
+    # entries; hide the tower so those keys don't reach the load as unexpected.
+    return hide_visual_missing_from_checkpoint(model, getattr(args, "load", None))
+
+
 def load_model_state(
     args: Namespace,
     *,
@@ -981,7 +1027,7 @@ def load_model_state(
 
         load_ctx = hide_adapters(model)
     else:
-        load_ctx = nullcontext()
+        load_ctx = _glm5_next_visual_load_context(args, model)
 
     load_dir = getattr(args, "load", None)
     native_optimizer_restored = False
