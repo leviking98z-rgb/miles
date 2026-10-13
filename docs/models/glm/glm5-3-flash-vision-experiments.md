@@ -5,12 +5,15 @@ reproduce each number. The feature itself is documented in
 [glm5-3-flash.md](glm5-3-flash.md#6-bf16-image-sft); this page is the evidence
 behind it.
 
-**Current status, 2026-10-13 09:33 Beijing:** full-scale training and validated
+**Current status, 2026-10-13 10:52 Beijing:** full-scale training and validated
 multimodal export work. The corrected ChartQA baseline is 65.60%; self-distilled
 SFT with a frozen tower scores 67.40%, while the trainable-tower arm scores
 65.04%. This first paired run does not meet the goal: training the tower reduces
-accuracy by 2.36 percentage points. A separate improved-data experiment is
-running. Sections 1-4 preserve the earlier GEO3K evidence and withdrawn evaluation.
+accuracy by 2.36 percentage points under the unchanged scoring contract. A
+separate improved-data experiment is running: its frozen arm has finished 96
+steps and is exporting; its full arm has finished 59 of 96 steps. Neither has a
+completed second-round evaluation. Sections 1-4 preserve the earlier GEO3K
+evidence and withdrawn evaluation.
 
 ## 1. Full-model training run
 
@@ -236,6 +239,57 @@ The full export has all 45 language layers,
 with maximum absolute update `0.0009765625`, and the exported visual weights are
 finite. These checks establish an actual cumulative update, not improved accuracy.
 
+### First-Round Diagnosis
+
+A paired audit of all 2500 ordered predictions separates observed errors from
+unverified explanations. The net loss is 59 correct answers: 49 in the machine
+half and 10 in the human half. Numeric-answer questions account for a net loss
+of 49, and text-answer questions for 10; these are overlapping breakdowns, not
+additive causes. Both arms close their reasoning block in 2494 outputs and fail
+to close it in six, so extra output truncation does not explain the gap.
+
+Answer presentation is an important confound. The unchanged scorer evaluates
+the first nonempty line after `</think>` as a whole. It strips bold markers but
+does not accept appended units or explanations. For example, the full arm
+answers `**524** (thousand persons)` where the label is `524`, and sometimes
+emits `Yes, ...` where the label is `Yes`.
+
+An additional diagnostic extracts only an anchored leading numeric or yes/no
+token. It does not search the output for the gold value and does not change the
+official score:
+
+| Paired Change | Count | With a Matching Leading Token in the Rejected Answer |
+|---|---:|---:|
+| `none` correct, `full` rejected | 140 | 95 |
+| `full` correct, `none` rejected | 81 | 26 |
+
+Matching uses the existing relaxed numeric tolerance. A matching prefix does
+not establish correct units, a unique answer, full-response semantic correctness,
+or image-grounded reasoning. This table therefore cannot turn the negative
+result into a successful training result. It does show that the 2.36-point gap
+cannot be equated directly with a 2.36-point loss in visual recognition.
+Genuine value errors also occur: one machine question with label `315` receives
+`315` from `none` and `2616` from `full`.
+
+The training audit establishes three limitations that need separate controlled
+experiments before claiming a cause:
+
+- The 1480 retained traces are all human-authored questions, covering 923 unique
+  chart contents. The 184 steps at batch 32 expose about 3.98 dataset passes.
+- Visual and language parameters both use `1e-5`. The visual learning rate was
+  not independently tuned, and there is no training-derived held-out selection
+  result establishing that this update strength or duration generalizes.
+- The teacher's complete reasoning and final answer were filtered, but
+  intermediate reasoning was not checked step by step against the image.
+  Final-answer correctness alone does not verify those steps.
+
+Data coverage, overly strong adaptation, and reasoning quality are hypotheses,
+not proven causes. A follow-up validation set must come from training-source
+charts absent from both preceding training inputs and teacher training exposure.
+Simply holding out some of the already used 3017 rows would not establish
+independence. No test questions or answers are used for data generation,
+filtering, or configuration selection.
+
 ### Measured Wall Time
 
 Times below come from supervisor records, rank-zero training timers, checkpoint
@@ -294,10 +348,23 @@ both arms. `none` started on bj47 at 09:11 Beijing; `full` started on bj48 at
 different data and initialization, not directly interchangeable with the
 first-round results.
 
+At 10:52 Beijing, `none` has completed iteration 95 and is converting its final
+checkpoint; `full` has completed iteration 58. Both have finite logged losses
+and gradient norms. This is training progress, not evidence of improved eval.
+Each node now runs a bounded two-worker CPU prefetch task which watches complete
+converter shards and verifies source and local-copy SHA256. The evaluation cache
+may adopt these exact bytes by hardlink, with source-identity checks and normal
+copy fallback. This overlaps export with local staging without changing model
+weights, precision, predictions, or scoring. Real-shard structural validation
+passed in the owned runtime; end-to-end staging time saved is not yet measured.
+
 Operational scripts and evidence are under
 `/root/sync/zwfy/miles-glm53-vision-sft/`: `scripts/compare_chartqa_results.py`,
 `scripts/summarize_chartqa_timings.py`, `logs/chartqa_none_seed42.evaluation.json`,
 `logs/distilled_training_audit.json`, and
 `data/chartqa/distill_v2/sft_exact.manifest.json`. The second-round comparison
 rejects mismatched data hashes, initial checkpoint steps, step counts, or partial
-evaluation results.
+evaluation results. The paired diagnostic is
+`logs/chartqa_seed42_error_analysis.json`, generated by
+`scripts/analyze_chartqa_errors.py`; its prefix classification is diagnostic
+only and is covered by CPU tests.
