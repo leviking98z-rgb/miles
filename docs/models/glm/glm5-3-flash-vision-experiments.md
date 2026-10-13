@@ -5,8 +5,12 @@ reproduce each number. The feature itself is documented in
 [glm5-3-flash.md](glm5-3-flash.md#6-bf16-image-sft); this page is the evidence
 behind it.
 
-**Summary: the training path works at full scale; its effect on image-task quality
-is not measured.** Nothing here says that training the visual tower helps.
+**Current status, 2026-10-13 09:33 Beijing:** full-scale training and validated
+multimodal export work. The corrected ChartQA baseline is 65.60%; self-distilled
+SFT with a frozen tower scores 67.40%, while the trainable-tower arm scores
+65.04%. This first paired run does not meet the goal: training the tower reduces
+accuracy by 2.36 percentage points. A separate improved-data experiment is
+running. Sections 1-4 preserve the earlier GEO3K evidence and withdrawn evaluation.
 
 ## 1. Full-model training run
 
@@ -149,15 +153,16 @@ the Miles processor *and* passing the images makes its loader reject the request
 `input_ids` plus base64 data URIs, posted to a server endpoint rather than driven
 through the Engine API.
 
-**No corrected number is given here on purpose.** The harness is not fixed yet, and a
-figure measured through a path that is known to drop the image would be worse than no
-figure. The training results in section 1 are unaffected: they come from the training
-path, which uses the processor directly and is covered by the e2e test.
+**No corrected GEO3K number is given.** The old predictions are not reused.
+Section 5 records a separate, corrected ChartQA evaluation. The training results
+in section 1 are unaffected: they come from the training path, which uses the
+processor directly and is covered by the e2e test.
 
 ## 3. What is not measured, and why GEO3K cannot measure it
 
-There is **no evidence about whether training the visual tower improves image-task
-quality**, and this dataset cannot provide it.
+At the time of these GEO3K runs, there was **no evidence about whether training
+the visual tower improves image-task quality**. Their bare-answer training
+targets are not the reasoning data used for the later ChartQA experiment.
 
 GEO3K's prompt asks the model to "Solve the following math problem step by step",
 but its SFT target contains no steps - just `Answer: \boxed{48}`, a median of 18
@@ -186,3 +191,113 @@ text - the untrained slice emits `Unload unload unload...` and a trained one emi
 configurations. That one survives the withdrawal above: a model emitting `}}}}` is
 broken whether or not an image reached it, so the conclusion rests on the output text
 rather than on the evaluation path.
+
+## 5. Corrected ChartQA Self-Distillation Experiment
+
+This is a separate 45-layer experiment, not a reinterpretation of the withdrawn
+GEO3K evaluation. Training inputs are ChartQA **training** images and questions;
+assistant targets are the teacher's generated reasoning and answer, not the
+dataset's bare label. The first-round teacher is the original GLM-5.3-Flash.
+Only predictions with complete reasoning and a relaxed-correct final answer were
+retained: 1480 of 2101 training questions. An audit verifies image/question
+alignment and verbatim generated targets. These 2101 source questions were all
+human-authored; that coverage limitation motivates the independent second round.
+
+Both arms train the language model for 184 optimizer steps at global batch 32,
+learning rate `1e-5`, and training/data-shuffle seed 42. `none` freezes the entire
+visual tower; `full` trains it and enables visual recomputation. Each arm uses
+its own 32-H20 TP8/PP4/EP8 cluster. `full` omits optimizer-state **saving** to
+reduce checkpoint I/O; optimizer computation is unchanged.
+
+The corrected evaluation applies the native chat template and multimodal
+processor, provides the actual images with their expanded token positions, and
+uses deterministic decoding with a 1024-new-token limit. Four independent TP8
+replicas each evaluate 625 questions. Predictions are merged in original order
+and checked against all 2500 test questions before scoring. Test answers are used
+only for evaluation, never teacher generation, filtering, or training.
+
+| Model | Correct / 2500 | Relaxed Accuracy | Human / 1250 | Machine / 1250 |
+|---|---:|---:|---:|---:|
+| Original model | 1640 | 65.60% | 77.44% | 53.76% |
+| Self-distilled `none`, seed 42 | 1685 | 67.40% | 80.08% | 54.72% |
+| Self-distilled `full`, seed 42 | 1626 | 65.04% | 79.28% | 50.80% |
+
+The frozen-tower arm improves by **1.80 percentage points** over the original
+model. The trainable-tower arm is **2.36 points below `none`** and **0.56 points
+below the original model**. In the paired predictions, both arms answer 1545
+questions correctly; `full` fixes 81 that `none` misses, but misses 140 that
+`none` answers correctly. Both miss 734. The largest subgroup regression is
+machine-authored questions (50.80% versus 54.72%); human accuracy also decreases
+(79.28% versus 80.08%). This is one seed and one data/configuration choice, not
+proof that visual training cannot help other configurations.
+
+The full export has all 45 language layers,
+74001 language tensors, and all 347 visual tensors; 260 visual tensors changed,
+with maximum absolute update `0.0009765625`, and the exported visual weights are
+finite. These checks establish an actual cumulative update, not improved accuracy.
+
+### Measured Wall Time
+
+Times below come from supervisor records, rank-zero training timers, checkpoint
+timestamps, and completed evaluation timing files, not estimated GPU FLOPs.
+
+| Component | `none` Seconds | `full` Seconds |
+|---|---:|---:|
+| Training wall time | 13179.4 | 8539.2 |
+| Initialization and weight loading | 3336.3 | 2578.2 |
+| First train step, including cold kernel work | 907.7 | 908.8 |
+| Remaining 183 rank-zero train timers | 2948.6 | 3353.6 |
+| Checkpoint I/O | 4806.5 | 648.0 |
+| Between-step and teardown residual | 1180.3 | 1050.6 |
+| Export prepare / convert / finalize | 22.5 / 1807.0 / 293.3 | 18.3 / 2261.1 / 249.3 |
+| Successful four-replica evaluation wall time | 2017.6 | 2887.8 |
+
+`none`'s completed successful-stage sum is 17319.8 seconds, about 4 hours
+49 minutes; `full`'s is 13955.7 seconds, about 3 hours 53 minutes. These exclude
+failed attempts and idle gaps. The runs overlap on two
+clusters, so adding their wall times does not measure total project elapsed
+time. The lower full training wall time is mostly a checkpoint-saving
+difference; its steady rank-zero train timer is **18.33 s** versus **16.11 s**
+for `none`, not evidence of faster visual computation.
+
+An initial shared-filesystem mmap evaluation stalled in page waits and was
+preserved as a failed attempt. The successful path stages the exported model to
+each node's local cache with source/readback SHA256 checks and atomic writes.
+For `none`, per-worker staging took 1274-1542 s, preprocessing 52-60 s, model
+loading 108-110 s, and inference 217-528 s. Reusing the verified teacher cache
+took about 18 s with zero model bytes copied. The full evaluation's first cache
+staging took 2366-2403 s per node, preprocessing 63-73 s, model loading 106-110 s,
+and inference 275-304 s. Its pipeline supervisor finished successfully at
+09:32:43 Beijing on October 13.
+
+### Independent Second Round
+
+The original 1480-row dataset remains unchanged. A separate training-only
+candidate set contains 1500 novel machine questions, 1000 novel human questions,
+and 621 previously rejected questions, deduplicated by chart content and
+question. The first-round `none` checkpoint generated a new sampled reasoning
+trace for each candidate (`temperature=0.6`, `top_p=0.9`, 1536 new tokens, stable
+seed `42 + global_row_index`).
+
+The stricter filter accepts exact finite numeric equality or normalized text
+equality, and one complete reasoning block with at least 32 characters. It keeps
+1449 original exact-answer traces plus 1568 new traces, for **3017** conversations:
+2298 human and 719 machine. New retained rows include 733 novel human questions,
+719 novel machine questions, and 116 recovered prior failures. Final-answer
+correctness is not proof that every intermediate reasoning step is grounded.
+
+Both second-round arms start from the same first-round `none` language checkpoint
+at iteration 183 and the original visual tower. They use the same 3017-row
+dataset hash, seed 42, and 96 optimizer steps, saving only the final model in
+both arms. `none` started on bj47 at 09:11 Beijing; `full` started on bj48 at
+09:32:56, after the first full pipeline finished successfully. These are follow-up experiments with
+different data and initialization, not directly interchangeable with the
+first-round results.
+
+Operational scripts and evidence are under
+`/root/sync/zwfy/miles-glm53-vision-sft/`: `scripts/compare_chartqa_results.py`,
+`scripts/summarize_chartqa_timings.py`, `logs/chartqa_none_seed42.evaluation.json`,
+`logs/distilled_training_audit.json`, and
+`data/chartqa/distill_v2/sft_exact.manifest.json`. The second-round comparison
+rejects mismatched data hashes, initial checkpoint steps, step counts, or partial
+evaluation results.
