@@ -123,7 +123,7 @@ def init(
 
     # Random seeds for reproducibility.
     set_random_seed_from_args(args)
-    register_hf_config_aliases()
+    register_hf_config_aliases(args.tokenizer_model)
     _build_tokenizer(args)
     # We won't use this. initialize to pass some validation in megatron.
     init_num_microbatches_calculator(
